@@ -23,14 +23,14 @@ class ContinuousHealthMonitor:
 
     def __init__(
         self,
-        hr_threshold_low=40,                 # user min HR
-        hr_threshold_high=180,               # user max HR
+        hr_threshold_low=30,                 # user min HR
+        hr_threshold_high=220,               # user max HR
         hydration_threshold_low=0.30,        # user min hydration (0–1)
-        hydration_threshold_high=0.95,       # user max hydration (0–1)
-        hr_hold_ticks=5,                     # how many ticks HR must persist abnormal
-        hyd_hold_ticks=2,                    # how many ticks hydration must persist abnormal
-        hr_disconnect_hold_ticks=1,          # how many ticks HR missing before persistent disconnect
-        hyd_disconnect_hold_ticks=1,         # how many ticks hyd missing before persistent disconnect
+        hydration_threshold_high=1,       # user max hydration (0–1)
+        hr_hold_ticks=5,                     # how many ticks HR must persist abnormal 5s
+        hyd_hold_ticks=2,                    # how many ticks hydration must persist abnormal 10min
+        hr_disconnect_hold_ticks=5,          # how many ticks HR missing before persistent disconnect
+        hyd_disconnect_hold_ticks=5,         # how many ticks hyd missing before persistent disconnect
     ):
         # Store thresholds as floats so comparisons are consistent
         self.hr_threshold_low = float(hr_threshold_low)
@@ -80,12 +80,12 @@ class ContinuousHealthMonitor:
             self.alarm_history.pop(0)
 
     def is_hr_abnormal(self, hr_value):
-        # HR abnormal means outside user min/max (but NaN is handled by disconnect logic)
+        # HR abnormal means outside user min/max (but NaN is handled by disconnect logic) (new change ~87)
         if hr_value is None or pd.isna(hr_value):
             return False
         hr_value = float(hr_value)
         return (hr_value < self.hr_threshold_low) or (hr_value > self.hr_threshold_high)
-
+    
     def is_hydration_abnormal(self, hydration_value):
         # Hydration abnormal means outside user min/max (0–1 scale)
         if hydration_value is None or pd.isna(hydration_value):
@@ -329,31 +329,158 @@ st.sidebar.title("⚙️ Settings")
 
 # These profile inputs are just for realism (not used for computations right now)
 st.sidebar.markdown("### User Profile Inputs")
-age = st.sidebar.number_input("Age (years)", min_value=1, max_value=120, value=25)
-weight = st.sidebar.number_input("Weight (kg)", min_value=20.0, max_value=250.0, value=70.0)
-height = st.sidebar.number_input("Height (cm)", min_value=100.0, max_value=230.0, value=170.0)
-gender = st.sidebar.selectbox("Gender", ["Female", "Male", "Other"])
+age = st.sidebar.number_input("Age (years)", min_value=1, max_value=120, value=25, key="age")
+weight = st.sidebar.number_input("Weight (kg)", min_value=20.0, max_value=250.0, value=70.0, key="weight")
+height = st.sidebar.number_input("Height (cm)", min_value=100.0, max_value=230.0, value=170.0, key="height")
+gender = st.sidebar.selectbox("Gender", ["Female", "Male", "Other"], key="gender")
 
-# Preset modes only set default values in the sidebar
-mode = st.sidebar.selectbox("Profile", ["General", "Athlete", "Sleep", "Disorder-safe (flag only)"], index=0)
+# Calculate personalized thresholds based on profile (new change ~396)
+@st.cache_data
+def calculate_personalized_thresholds(age, weight, height, gender):
+    """Calculate personalized HR and hydration thresholds"""
+    
+    # Maximum heart rate (traditional formula)
+    hr_max = 220 - age
+    
+    # Resting heart rate varies by gender and fitness
+    if gender == "Female":
+        resting_hr = 65  # Females slightly higher resting HR
+    elif gender == "Male":
+        resting_hr = 60
+    else:
+        resting_hr = 62
+    
+    # Heart rate zones (percentage of max)
+    hr_normal_min = resting_hr  # Lower bound of normal
+    hr_normal_max = int(0.85 * hr_max)  # 85% of max is upper normal
+    
+    # Hydration thresholds based on body weight
+    # Total Body Water (TBW) estimate: ~60% of body weight for men, ~50% for women
+    if gender == "Female":
+        tbw_percent = 0.50
+    elif gender == "Male":
+        tbw_percent = 0.60
+    else:
+        tbw_percent = 0.55
+    
+    total_body_water_liters = weight * tbw_percent
+    
+    # Dehydration threshold: loss of 2% of body weight from water
+    dehydration_threshold = 1.0 - (0.02 * weight / total_body_water_liters)
+    
+    # Overhydration threshold (rare, but for safety)
+    overhydration_threshold = 1.05  # 5% above normal
+    
+    return {
+        'hr_max': hr_max,
+        'resting_hr': resting_hr,
+        'hr_normal_min': hr_normal_min,
+        'hr_normal_max': hr_normal_max,
+        'dehydration_threshold': max(0.3, dehydration_threshold),  # Don't go below 0.3
+        'overhydration_threshold': overhydration_threshold,
+        'total_body_water_liters': total_body_water_liters
+    }
 
-# Preset defaults
-if mode == "General":
-    default_hr_min, default_hr_max, default_jump = 45, 185, 40
-    default_hyd_min, default_hyd_max = 0.30, 0.95
-    auto_clean_default = True
-elif mode == "Athlete":
-    default_hr_min, default_hr_max, default_jump = 50, 205, 50
-    default_hyd_min, default_hyd_max = 0.20, 0.95
-    auto_clean_default = True
-elif mode == "Sleep":
-    default_hr_min, default_hr_max, default_jump = 30, 100, 30
-    default_hyd_min, default_hyd_max = 0.30, 0.95
-    auto_clean_default = True
+# Calculate personalized thresholds
+personalized = calculate_personalized_thresholds(age, weight, height, gender)
+
+# Display personalized info in sidebar
+with st.sidebar.expander("Your Personalized Metrics", expanded=False):
+    st.write(f"**Max HR:** {personalized['hr_max']} bpm")
+    st.write(f"**Resting HR:** {personalized['resting_hr']} bpm")
+    st.write(f"**Normal HR Range:** {personalized['hr_normal_min']}-{personalized['hr_normal_max']} bpm")
+    st.write(f"**Total Body Water:** {personalized['total_body_water_liters']:.1f} L")
+    st.write(f"**Dehydration threshold:** {personalized['dehydration_threshold']:.2f}")
+
+
+# # Preset modes only set default values in the sidebar
+# mode = st.sidebar.selectbox("Profile", ["General", "Athlete", "Sleep", "Disorder-safe (flag only)"], index=0)
+
+# # Preset defaults
+# if mode == "General":
+#     default_hr_min, default_hr_max, default_jump = 45, 185, 40
+#     default_hyd_min, default_hyd_max = 0.30, 1.00
+#     auto_clean_default = True
+# if mode == "Athlete":
+#     default_hr_min, default_hr_max, default_jump = 50, 205, 50
+#     default_hyd_min, default_hyd_max = 0.20, 1.00
+#     auto_clean_default = True
+# elif mode == "Sleep":
+#     default_hr_min, default_hr_max, default_jump = 30, 100, 30
+#     default_hyd_min, default_hyd_max = 0.30, 1.00
+#     auto_clean_default = True
+# else:
+#     default_hr_min, default_hr_max, default_jump = 45, 220, 60
+#     default_hyd_min, default_hyd_max = 0.10, 1.00
+#     auto_clean_default = False
+
+# ============================================================
+# Thresholds - NOW USING PERSONALIZED VALUES AS DEFAULTS
+# ============================================================
+st.sidebar.markdown("### Alert Thresholds") #new change ~482
+
+# Option to use personalized defaults or manual
+use_personalized = st.sidebar.checkbox("Use personalized thresholds", value=True)
+
+default_jump = 40
+auto_clean_default = True
+
+if use_personalized:
+    # Use calculated personalized values
+    default_hr_min = personalized['hr_normal_min']
+    default_hr_max = personalized['hr_normal_max']
+    default_hyd_min = personalized['dehydration_threshold']
+    default_hyd_max = personalized['overhydration_threshold']
+    
+    # Show that personalized mode is active
+    st.sidebar.success("✅ Using your personalized thresholds")
 else:
-    default_hr_min, default_hr_max, default_jump = 45, 220, 60
-    default_hyd_min, default_hyd_max = 0.10, 1.00
-    auto_clean_default = False
+    # Manual mode with presets
+    mode = st.sidebar.selectbox("Profile Preset", ["General", "Athlete", "Sleep", "Disorder-safe"], index=0)
+    
+    if mode == "General":
+        default_hr_min, default_hr_max = 45, 185
+        default_hyd_min, default_hyd_max = 0.30, 1.00
+    elif mode == "Athlete":
+        default_hr_min, default_hr_max = 40, 200
+        default_hyd_min, default_hyd_max = 0.20, 1.00
+    elif mode == "Sleep":
+        default_hr_min, default_hr_max = 40, 100
+        default_hyd_min, default_hyd_max = 0.30, 1.00
+    else:  # Disorder-safe
+        default_hr_min, default_hyd_min = 30, 0.10
+        default_hr_max, default_hyd_max = 220, 1.00
+    
+    default_jump = 40  # Default jump threshold
+    auto_clean_default = True
+
+with st.sidebar.expander("Set Thresholds Manually", expanded=not use_personalized):
+    hr_min = st.number_input("Heart Rate min (bpm)", 
+                            value=float(default_hr_min), 
+                            step=1.0,
+                            help="Below this triggers low HR alert")
+    
+    hr_max = st.number_input("Heart Rate max (bpm)", 
+                            value=float(default_hr_max), 
+                            step=1.0,
+                            help="Above this triggers high HR alert")
+
+    hyd_min = st.number_input("Hydration min (0–1)", 
+                             value=float(default_hyd_min), 
+                             step=0.05, 
+                             format="%.2f",
+                             help="Below this indicates dehydration")
+    
+    hyd_max = st.number_input("Hydration max (0–1)", 
+                             value=float(default_hyd_max), 
+                             step=0.05, 
+                             format="%.2f",
+                             help="Above this may indicate overhydration")
+
+    max_delta = st.number_input("Max HR jump (bpm/s)", 
+                               value=40.0, 
+                               step=1.0,
+                               help="Sudden jumps above this are flagged as artifacts")
 
 # User-defined thresholds (this is what you wanted: user chooses min/max)
 with st.sidebar.expander("Thresholds", expanded=True):
@@ -726,6 +853,31 @@ with tab1:
         else:
             st.caption("No alarms have been triggered yet.")
 
+        # new change ~879
+        st.markdown("### 💡 Personalized Health Tips")
+        # Generate tips based on current readings and profile
+        tips = []
+
+        # HR-based tips
+        if not pd.isna(hr_used):
+            hr_current = float(hr_used)
+            if hr_current > personalized['hr_normal_max'] * 0.9:
+                tips.append("• Your heart rate is approaching your max. Consider resting.")
+            elif hr_current < personalized['resting_hr'] * 0.9 and hr_current > 40:
+                tips.append("• Your heart rate is lower than usual for your profile. This could indicate good fitness or need for check.")
+        # Hydration tips based on gender and weight
+        if not pd.isna(hyd_used):
+            hyd_current = float(hyd_used)
+            daily_water_needs = weight * 0.033  # 33ml per kg
+            if hyd_current < personalized['dehydration_threshold'] * 1.1:
+                tips.append(f"• You may need hydration. Based on your weight ({weight}kg), aim for {daily_water_needs:.1f}L daily.")
+        
+        if tips:
+            for tip in tips:
+                st.info(tip)
+        else:
+            st.success("• All readings normal for your profile!")
+
     with right_col:
         # Active flags this tick (instant flags)
         active_now = []
@@ -735,7 +887,7 @@ with tab1:
         if dyn_flags["hyd_out_of_range"]:
             active_now.append("🔴 Hydration outside user range")
         if dyn_flags["hr_artifact"]:
-            active_now.append("🟠 HR artifact (sudden jump)")
+            active_now.append("🔴 HR artifact (sudden jump)")
         if dyn_flags["hr_missing"]:
             active_now.append("🔴 HR missing (disconnect)")
         if dyn_flags["hyd_missing"]:
@@ -774,6 +926,21 @@ with tab1:
                 st.dataframe(ev.iloc[::-1].head(12), use_container_width=True, hide_index=True)
             else:
                 st.caption("No transitions yet.")
+
+    # Profile summary expander (new change ~918)
+    with st.expander("👤 Your Profile Summary", expanded=False):
+        prof_col1, prof_col2, prof_col3 = st.columns(3)
+        with prof_col1:
+            st.metric("Age", f"{age} years")
+            st.metric("Gender", gender)
+        with prof_col2:
+            st.metric("Weight", f"{weight} kg")
+            st.metric("Height", f"{height} cm")
+        with prof_col3:
+            st.metric("BMI", f"{weight/((height/100)**2):.1f}")
+            st.metric("Est. Body Water", f"{personalized['total_body_water_liters']:.1f} L")
+        
+        st.caption("Your thresholds are personalized based on these values")
 
 # ============================================================
 # Tab 2: Trends (charts)
