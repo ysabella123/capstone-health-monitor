@@ -1,4 +1,5 @@
-# Capstone Project – Live Heart Rate + Hydration Monitoring Dashboard (Streamlit)
+# LAST UPDATED: 03/19/2026 added blood oxygen support, personalized thresholds, and other improvements
+# Capstone Project – Live Heart Rate + Hydration + Blood Oxygen Monitoring Dashboard (Streamlit)
 
 # This app simulates a wearable monitoring dashboard using a 2-hour, 1 Hz dataset.
 
@@ -26,35 +27,47 @@ class ContinuousHealthMonitor:
         hr_threshold_low=30,                 # user min HR
         hr_threshold_high=220,               # user max HR
         hydration_threshold_low=0.30,        # user min hydration (0–1)
-        hydration_threshold_high=1,       # user max hydration (0–1)
-        hr_hold_ticks=5,                     # how many ticks HR must persist abnormal 5s
-        hyd_hold_ticks=2,                    # how many ticks hydration must persist abnormal 10min
+        hydration_threshold_high=1.0,        # user max hydration (0–1)
+        spo2_threshold_low=95.0,             # user min blood oxygen (%)
+        spo2_threshold_high=100.0,           # user max blood oxygen (%)
+        hr_hold_ticks=5,                     # how many ticks HR must persist abnormal
+        hyd_hold_ticks=2,                    # how many ticks hydration must persist abnormal
+        spo2_hold_ticks=3,                   # how many ticks SpO₂ must persist abnormal
         hr_disconnect_hold_ticks=5,          # how many ticks HR missing before persistent disconnect
         hyd_disconnect_hold_ticks=5,         # how many ticks hyd missing before persistent disconnect
+        spo2_disconnect_hold_ticks=5,        # how many ticks SpO₂ missing before persistent disconnect
     ):
         # Store thresholds as floats so comparisons are consistent
         self.hr_threshold_low = float(hr_threshold_low)
         self.hr_threshold_high = float(hr_threshold_high)
         self.hydration_threshold_low = float(hydration_threshold_low)
         self.hydration_threshold_high = float(hydration_threshold_high)
+        self.spo2_threshold_low = float(spo2_threshold_low)
+        self.spo2_threshold_high = float(spo2_threshold_high)
 
         # Hold times in ticks (UI ticks, not necessarily 1 second if you use update_every > 1)
         self.hr_hold_ticks = int(hr_hold_ticks)
         self.hyd_hold_ticks = int(hyd_hold_ticks)
+        self.spo2_hold_ticks = int(spo2_hold_ticks)
         self.hr_disconnect_hold_ticks = int(hr_disconnect_hold_ticks)
         self.hyd_disconnect_hold_ticks = int(hyd_disconnect_hold_ticks)
+        self.spo2_disconnect_hold_ticks = int(spo2_disconnect_hold_ticks)
 
         # Persistence counters (how long the issue has lasted)
         self.abnormal_hr_count = 0
         self.abnormal_hydration_count = 0
+        self.abnormal_spo2_count = 0
         self.hr_missing_count = 0
         self.hyd_missing_count = 0
+        self.spo2_missing_count = 0
 
         # Persistent warning states
         self.hr_disconnection_warning = False
         self.hydration_disconnection_warning = False
+        self.spo2_disconnection_warning = False
         self.hr_abnormal_warning = False
         self.hydration_abnormal_warning = False
+        self.spo2_abnormal_warning = False
 
         # Simulated actuator state (vibration motor idea)
         self.motor_on = False
@@ -80,7 +93,7 @@ class ContinuousHealthMonitor:
             self.alarm_history.pop(0)
 
     def is_hr_abnormal(self, hr_value):
-        # HR abnormal means outside user min/max (but NaN is handled by disconnect logic) (new change ~87)
+        # HR abnormal means outside user min/max (but NaN is handled by disconnect logic)
         if hr_value is None or pd.isna(hr_value):
             return False
         hr_value = float(hr_value)
@@ -92,6 +105,13 @@ class ContinuousHealthMonitor:
             return False
         hydration_value = float(hydration_value)
         return (hydration_value < self.hydration_threshold_low) or (hydration_value > self.hydration_threshold_high)
+
+    def is_spo2_abnormal(self, spo2_value):
+        # Blood oxygen abnormal means outside user min/max (% scale)
+        if spo2_value is None or pd.isna(spo2_value):
+            return False
+        spo2_value = float(spo2_value)
+        return (spo2_value < self.spo2_threshold_low) or (spo2_value > self.spo2_threshold_high)
 
     def process_hr(self, live_dt: datetime, hr_value):
         # Run on every UI tick with the current HR value (raw value)
@@ -177,13 +197,55 @@ class ContinuousHealthMonitor:
 
         self.update_motor_state(live_dt)
 
+    def process_spo2(self, live_dt: datetime, spo2_value):
+        # Run on every UI tick with current blood oxygen value (%)
+        # Same persistence logic concept as HR and hydration.
+
+        if spo2_value is None or pd.isna(spo2_value):
+            self.spo2_missing_count += 1
+
+            if self.spo2_missing_count >= self.spo2_disconnect_hold_ticks and not self.spo2_disconnection_warning:
+                self.spo2_disconnection_warning = True
+                self._log_alarm(live_dt, "SpO₂ Disconnect", "Blood oxygen signal missing")
+
+            self.update_motor_state(live_dt)
+            return
+
+        # SpO₂ present -> reset missing counter
+        self.spo2_missing_count = 0
+
+        # Clear persistent disconnect if it was active
+        if self.spo2_disconnection_warning:
+            self.spo2_disconnection_warning = False
+            self._log_alarm(live_dt, "SpO₂ Disconnect", "Reconnected", is_clear=True)
+
+        # Abnormal SpO₂ persistence logic
+        if self.is_spo2_abnormal(spo2_value):
+            self.abnormal_spo2_count += 1
+            if self.abnormal_spo2_count >= self.spo2_hold_ticks and not self.spo2_abnormal_warning:
+                self.spo2_abnormal_warning = True
+                self._log_alarm(
+                    live_dt,
+                    "SpO₂ Abnormal",
+                    f"{float(spo2_value):.1f}% for {self.abnormal_spo2_count} ticks",
+                )
+        else:
+            if self.spo2_abnormal_warning:
+                self.spo2_abnormal_warning = False
+                self._log_alarm(live_dt, "SpO₂ Abnormal", "Returned to normal", is_clear=True)
+            self.abnormal_spo2_count = 0
+
+        self.update_motor_state(live_dt)
+
     def update_motor_state(self, live_dt: datetime):
         # Motor turns ON if any persistent alarm is active
         new_motor_state = (
             self.hr_disconnection_warning
             or self.hydration_disconnection_warning
+            or self.spo2_disconnection_warning
             or self.hr_abnormal_warning
             or self.hydration_abnormal_warning
+            or self.spo2_abnormal_warning
         )
 
         # Only log when the motor state changes
@@ -198,10 +260,14 @@ class ContinuousHealthMonitor:
             warnings.append("🔴 HR sensor disconnected / missing (persistent)")
         if self.hydration_disconnection_warning:
             warnings.append("🔴 Hydration sensor disconnected / missing (persistent)")
+        if self.spo2_disconnection_warning:
+            warnings.append("🔴 Blood oxygen sensor disconnected / missing (persistent)")
         if self.hr_abnormal_warning:
             warnings.append("🔴 HR outside user range persisted")
         if self.hydration_abnormal_warning:
             warnings.append("🔴 Hydration outside user range persisted")
+        if self.spo2_abnormal_warning:
+            warnings.append("🔴 Blood oxygen outside user range persisted")
         return warnings
 
     def get_status(self):
@@ -210,8 +276,10 @@ class ContinuousHealthMonitor:
             "motor_on": self.motor_on,
             "hr_disconnect": self.hr_disconnection_warning,
             "hyd_disconnect": self.hydration_disconnection_warning,
+            "spo2_disconnect": self.spo2_disconnection_warning,
             "hr_abnormal": self.hr_abnormal_warning,
             "hyd_abnormal": self.hydration_abnormal_warning,
+            "spo2_abnormal": self.spo2_abnormal_warning,
         }
 
 
@@ -223,7 +291,7 @@ class ContinuousHealthMonitor:
 BASE_DIR = Path(__file__).resolve().parent
 
 # Your sensor-only Excel file (must be in same folder as main.py unless you change this)
-EXCEL_FILE = BASE_DIR / "hr_hydration_training_2h_SENSOR_ONLY.xlsx"
+EXCEL_FILE = BASE_DIR / "hr_hydration_training_2h_SENSOR_ONLY_with_spo2.xlsx"
 
 # Sheet name
 SHEET = "Sheet1"
@@ -284,6 +352,18 @@ def load_data():
     df["hr_bpm_raw"] = pd.to_numeric(raw["heart_rate_bpm"], errors="coerce")
     df["hydration_ui_0to1"] = pd.to_numeric(raw["hydration_0to1"], errors="coerce")
 
+    # Blood oxygen column support
+    # This accepts a few possible Excel column names and standardizes them to spo2_percent
+    if "blood_oxygen_percent" in raw.columns:
+        df["spo2_percent"] = pd.to_numeric(raw["blood_oxygen_percent"], errors="coerce")
+    elif "spo2_percent" in raw.columns:
+        df["spo2_percent"] = pd.to_numeric(raw["spo2_percent"], errors="coerce")
+    elif "oxygen_percent" in raw.columns:
+        df["spo2_percent"] = pd.to_numeric(raw["oxygen_percent"], errors="coerce")
+    else:
+        # If no blood oxygen data exists yet, create an empty column so the UI still works
+        df["spo2_percent"] = np.nan
+
     # Baseline flags (NOT user threshold flags).
     # These are "general sensor" markers used mainly for clean signal building + markers.
     df["hr_flag_disconnect"] = df["hr_bpm_raw"].isna().astype(int)
@@ -334,7 +414,7 @@ weight = st.sidebar.number_input("Weight (kg)", min_value=20.0, max_value=250.0,
 height = st.sidebar.number_input("Height (cm)", min_value=100.0, max_value=230.0, value=170.0, key="height")
 gender = st.sidebar.selectbox("Gender", ["Female", "Male", "Other"], key="gender")
 
-# Calculate personalized thresholds based on profile (new change ~396)
+# Calculate personalized thresholds based on profile
 @st.cache_data
 def calculate_personalized_thresholds(age, weight, height, gender):
     """Calculate personalized HR and hydration thresholds"""
@@ -368,8 +448,8 @@ def calculate_personalized_thresholds(age, weight, height, gender):
     # Dehydration threshold: loss of 2% of body weight from water
     dehydration_threshold = 1.0 - (0.02 * weight / total_body_water_liters)
     
-    # Overhydration threshold (rare, but for safety)
-    overhydration_threshold = 1.05  # 5% above normal
+    # Overhydration threshold (rare, but kept inside 0–1 UI scale)
+    overhydration_threshold = 1.0
     
     return {
         'hr_max': hr_max,
@@ -393,31 +473,10 @@ with st.sidebar.expander("Your Personalized Metrics", expanded=False):
     st.write(f"**Dehydration threshold:** {personalized['dehydration_threshold']:.2f}")
 
 
-# # Preset modes only set default values in the sidebar
-# mode = st.sidebar.selectbox("Profile", ["General", "Athlete", "Sleep", "Disorder-safe (flag only)"], index=0)
-
-# # Preset defaults
-# if mode == "General":
-#     default_hr_min, default_hr_max, default_jump = 45, 185, 40
-#     default_hyd_min, default_hyd_max = 0.30, 1.00
-#     auto_clean_default = True
-# if mode == "Athlete":
-#     default_hr_min, default_hr_max, default_jump = 50, 205, 50
-#     default_hyd_min, default_hyd_max = 0.20, 1.00
-#     auto_clean_default = True
-# elif mode == "Sleep":
-#     default_hr_min, default_hr_max, default_jump = 30, 100, 30
-#     default_hyd_min, default_hyd_max = 0.30, 1.00
-#     auto_clean_default = True
-# else:
-#     default_hr_min, default_hr_max, default_jump = 45, 220, 60
-#     default_hyd_min, default_hyd_max = 0.10, 1.00
-#     auto_clean_default = False
-
 # ============================================================
 # Thresholds - NOW USING PERSONALIZED VALUES AS DEFAULTS
 # ============================================================
-st.sidebar.markdown("### Alert Thresholds") #new change ~482
+st.sidebar.markdown("### Alert Thresholds")
 
 # Option to use personalized defaults or manual
 use_personalized = st.sidebar.checkbox("Use personalized thresholds", value=True)
@@ -454,34 +513,6 @@ else:
     default_jump = 40  # Default jump threshold
     auto_clean_default = True
 
-with st.sidebar.expander("Set Thresholds Manually", expanded=not use_personalized):
-    hr_min = st.number_input("Heart Rate min (bpm)", 
-                            value=float(default_hr_min), 
-                            step=1.0,
-                            help="Below this triggers low HR alert")
-    
-    hr_max = st.number_input("Heart Rate max (bpm)", 
-                            value=float(default_hr_max), 
-                            step=1.0,
-                            help="Above this triggers high HR alert")
-
-    hyd_min = st.number_input("Hydration min (0–1)", 
-                             value=float(default_hyd_min), 
-                             step=0.05, 
-                             format="%.2f",
-                             help="Below this indicates dehydration")
-    
-    hyd_max = st.number_input("Hydration max (0–1)", 
-                             value=float(default_hyd_max), 
-                             step=0.05, 
-                             format="%.2f",
-                             help="Above this may indicate overhydration")
-
-    max_delta = st.number_input("Max HR jump (bpm/s)", 
-                               value=40.0, 
-                               step=1.0,
-                               help="Sudden jumps above this are flagged as artifacts")
-
 # User-defined thresholds (this is what you wanted: user chooses min/max)
 with st.sidebar.expander("Thresholds", expanded=True):
     hr_min = st.number_input("Heart Rate min (bpm)", value=float(default_hr_min), step=1.0)
@@ -489,6 +520,10 @@ with st.sidebar.expander("Thresholds", expanded=True):
 
     hyd_min = st.number_input("Hydration min (0–1)", value=float(default_hyd_min), step=0.05, format="%.2f")
     hyd_max = st.number_input("Hydration max (0–1)", value=float(default_hyd_max), step=0.05, format="%.2f")
+
+    # Blood oxygen min/max chosen by the user
+    spo2_min = st.number_input("Blood Oxygen min (%)", value=95.0, step=1.0)
+    spo2_max = st.number_input("Blood Oxygen max (%)", value=100.0, step=1.0)
 
     # Max HR jump threshold used for artifact detection (bpm per second)
     max_delta = st.number_input("Max HR jump (bpm/s)", value=float(default_jump), step=1.0)
@@ -565,6 +600,10 @@ if "prev_hr_for_flags" not in st.session_state:
 if "prev_dt_for_flags" not in st.session_state:
     st.session_state.prev_dt_for_flags = None
 
+# Prevent duplicate logging when Streamlit reruns without advancing the sample
+if "last_logged_sample" not in st.session_state:
+    st.session_state.last_logged_sample = None
+
 # Persistent monitor instance (stateful alarms)
 if "monitor" not in st.session_state:
     st.session_state.monitor = ContinuousHealthMonitor(
@@ -572,6 +611,8 @@ if "monitor" not in st.session_state:
         hr_threshold_high=hr_max,
         hydration_threshold_low=hyd_min,
         hydration_threshold_high=hyd_max,
+        spo2_threshold_low=spo2_min,
+        spo2_threshold_high=spo2_max,
     )
 
 # Keep monitor thresholds aligned with sidebar every rerun
@@ -579,6 +620,8 @@ st.session_state.monitor.hr_threshold_low = float(hr_min)
 st.session_state.monitor.hr_threshold_high = float(hr_max)
 st.session_state.monitor.hydration_threshold_low = float(hyd_min)
 st.session_state.monitor.hydration_threshold_high = float(hyd_max)
+st.session_state.monitor.spo2_threshold_low = float(spo2_min)
+st.session_state.monitor.spo2_threshold_high = float(spo2_max)
 
 # Clamp i so we never index out of bounds
 st.session_state.i = max(0, min(int(st.session_state.i), max(len(df) - 1, 0)))
@@ -607,10 +650,12 @@ def compute_dynamic_flags(live_dt: datetime, row, step_seconds: int):
 
     hr_raw = row["hr_bpm_raw"]
     hyd = row["hydration_ui_0to1"]
+    spo2 = row["spo2_percent"]
 
     # Missing flags
     hr_missing = int(pd.isna(hr_raw))
     hyd_missing = int(pd.isna(hyd))
+    spo2_missing = int(pd.isna(spo2))
 
     # User min/max range flags
     hr_out_of_range = 0
@@ -620,6 +665,11 @@ def compute_dynamic_flags(live_dt: datetime, row, step_seconds: int):
     hyd_out_of_range = 0
     if not pd.isna(hyd):
         hyd_out_of_range = int((float(hyd) < float(hyd_min)) or (float(hyd) > float(hyd_max)))
+
+    # Blood oxygen range flags based on user-selected limits
+    spo2_out_of_range = 0
+    if not pd.isna(spo2):
+        spo2_out_of_range = int((float(spo2) < float(spo2_min)) or (float(spo2) > float(spo2_max)))
 
     # Artifact/jump detection (uses previous HR and previous time)
     hr_artifact = 0
@@ -646,8 +696,10 @@ def compute_dynamic_flags(live_dt: datetime, row, step_seconds: int):
     return {
         "hr_missing": hr_missing,
         "hyd_missing": hyd_missing,
+        "spo2_missing": spo2_missing,
         "hr_out_of_range": hr_out_of_range,
         "hyd_out_of_range": hyd_out_of_range,
+        "spo2_out_of_range": spo2_out_of_range,
         "hr_artifact": hr_artifact,
     }
 
@@ -659,6 +711,7 @@ def append_flag_log(live_dt: datetime, idx: int, row, flags: dict):
             "sample": int(idx),
             "hr_bpm_raw": None if pd.isna(row["hr_bpm_raw"]) else float(row["hr_bpm_raw"]),
             "hydration_0to1": None if pd.isna(row["hydration_ui_0to1"]) else float(row["hydration_ui_0to1"]),
+            "spo2_percent": None if pd.isna(row["spo2_percent"]) else float(row["spo2_percent"]),
             **flags,
         }
     )
@@ -703,7 +756,7 @@ title_col, badge_col = st.columns([3, 1])
 
 with title_col:
     # Main page title
-    st.markdown("## ❤️💧 Capstone Heart Rate & Hydration Monitor")
+    st.markdown("## ❤️💧Capstone Heart Rate, Hydration & Blood Oxygen Monitor")
 
 with badge_col:
     # Small status pill at top right
@@ -740,6 +793,7 @@ with c3:
         st.session_state.flag_log = []
         st.session_state.event_log = []
         st.session_state.last_flags = None
+        st.session_state.last_logged_sample = None
 
         # Clear artifact detection history
         st.session_state.prev_hr_for_flags = None
@@ -751,6 +805,8 @@ with c3:
             hr_threshold_high=hr_max,
             hydration_threshold_low=hyd_min,
             hydration_threshold_high=hyd_max,
+            spo2_threshold_low=spo2_min,
+            spo2_threshold_high=spo2_max,
         )
 
         # Rerun so UI updates instantly
@@ -789,19 +845,25 @@ hr_used = choose_hr(row)
 # Hydration value (always raw)
 hyd_used = row["hydration_ui_0to1"]
 
+# Blood oxygen value (always raw)
+spo2_used = row["spo2_percent"]
+
 # Compute the live timestamp for this sample
 live_dt = st.session_state.stream_start_dt + timedelta(seconds=i)
 
 # Compute dynamic flags (these are the saved flags the user wanted)
 dyn_flags = compute_dynamic_flags(live_dt, row, step_seconds=step)
 
-# Append logs (per-sample log + transitions)
-append_flag_log(live_dt, i, row, dyn_flags)
-log_flag_transitions(live_dt, dyn_flags)
+# Append logs only once per sample to avoid duplicate rows on reruns
+if st.session_state.last_logged_sample != i:
+    append_flag_log(live_dt, i, row, dyn_flags)
+    log_flag_transitions(live_dt, dyn_flags)
+    st.session_state.last_logged_sample = i
 
 # Feed persistent monitor using live timestamps
 st.session_state.monitor.process_hr(live_dt, row["hr_bpm_raw"])
 st.session_state.monitor.process_hydration(live_dt, hyd_used)
+st.session_state.monitor.process_spo2(live_dt, spo2_used)
 
 # Persistent warnings (hold-based) + monitor states
 warnings = st.session_state.monitor.get_active_warnings()
@@ -813,21 +875,28 @@ monitor_status = st.session_state.monitor.get_status()
 # ============================================================
 
 with tab1:
-    # Four top metrics cards
-    k1, k2, k3, k4= st.columns(4)
+    # First row: HR, Hydration, Blood Oxygen
+    k1, k2, k3 = st.columns(3)
 
     with k1:
         st.metric("HR (bpm)", "—" if pd.isna(hr_used) else f"{float(hr_used):.1f}")
+        st.caption("Alerts use raw sensor data. Displayed HR may be auto-cleaned.")
 
     with k2:
         st.metric("Hydration (0–1)", "—" if pd.isna(hyd_used) else f"{float(hyd_used):.3f}")
 
     with k3:
+        st.metric("Blood Oxygen (%)", "—" if pd.isna(spo2_used) else f"{float(spo2_used):.1f}%")
+
+    # Second row: Timestamp and Battery
+    k4, k5 = st.columns(2)
+
+    with k4:
         st.metric("Live Timestamp", live_dt.strftime("%Y-%m-%d %H:%M:%S"))
 
     battery_pct = get_battery_percent_placeholder()
 
-    with k4:
+    with k5:
         st.metric(
             "Battery (%)",
             "—" if battery_pct is None else f"{int(battery_pct)}%"
@@ -841,9 +910,9 @@ with tab1:
     with left_col:
         # Persistent alerts (hold-based) are the "real alarms"
         if warnings:
-            st.warning("### ⏳ Persistent Alerts (monitor)\n" + "\n".join([f"- {w}" for w in warnings]))
+            st.warning("### ⏳ Persistent Alerts \n" + "\n".join([f"- {w}" for w in warnings]))
         else:
-            st.success("### ✅ No persistent alarms\nNo conditions have persisted long enough to trigger an alarm.")
+            st.success("### ✅ No Persistent Alarms\nNo conditions have persisted long enough to trigger an alarm.")
 
         # Alarm history is shown directly (not hidden)
         st.markdown("### 📋 Alarm History ")
@@ -853,7 +922,6 @@ with tab1:
         else:
             st.caption("No alarms have been triggered yet.")
 
-        # new change ~879
         st.markdown("### 💡 Personalized Health Tips")
         # Generate tips based on current readings and profile
         tips = []
@@ -865,13 +933,20 @@ with tab1:
                 tips.append("• Your heart rate is approaching your max. Consider resting.")
             elif hr_current < personalized['resting_hr'] * 0.9 and hr_current > 40:
                 tips.append("• Your heart rate is lower than usual for your profile. This could indicate good fitness or need for check.")
+
         # Hydration tips based on gender and weight
         if not pd.isna(hyd_used):
             hyd_current = float(hyd_used)
             daily_water_needs = weight * 0.033  # 33ml per kg
             if hyd_current < personalized['dehydration_threshold'] * 1.1:
                 tips.append(f"• You may need hydration. Based on your weight ({weight}kg), aim for {daily_water_needs:.1f}L daily.")
-        
+
+        # Blood oxygen tip if below the chosen safe range
+        if not pd.isna(spo2_used):
+            spo2_current = float(spo2_used)
+            if spo2_current < float(spo2_min):
+                tips.append("• Blood oxygen is below your selected threshold. Pause and check the sensor fit or the user condition.")
+
         if tips:
             for tip in tips:
                 st.info(tip)
@@ -886,12 +961,16 @@ with tab1:
             active_now.append("🔴 HR outside user range")
         if dyn_flags["hyd_out_of_range"]:
             active_now.append("🔴 Hydration outside user range")
+        if dyn_flags["spo2_out_of_range"]:
+            active_now.append("🔴 Blood oxygen outside user range")
         if dyn_flags["hr_artifact"]:
             active_now.append("🔴 HR artifact (sudden jump)")
         if dyn_flags["hr_missing"]:
             active_now.append("🔴 HR missing (disconnect)")
         if dyn_flags["hyd_missing"]:
             active_now.append("🔴 Hydration missing (disconnect)")
+        if dyn_flags["spo2_missing"]:
+            active_now.append("🔴 Blood oxygen missing (disconnect)")
 
         if active_now:
             st.error("### ⚠️ Active Flags \n" + "\n".join([f"- {x}" for x in active_now]))
@@ -901,9 +980,11 @@ with tab1:
         st.markdown("#### Quick checks")
         hr_ok = (not pd.isna(row["hr_bpm_raw"])) and (float(hr_min) <= float(row["hr_bpm_raw"]) <= float(hr_max))
         hyd_ok = (not pd.isna(hyd_used)) and (float(hyd_min) <= float(hyd_used) <= float(hyd_max))
+        spo2_ok = (not pd.isna(spo2_used)) and (float(spo2_min) <= float(spo2_used) <= float(spo2_max))
 
         st.write(f"- HR in user range: **{'Yes' if hr_ok else 'No'}**")
         st.write(f"- Hydration in user range: **{'Yes' if hyd_ok else 'No'}**")
+        st.write(f"- Blood oxygen in user range: **{'Yes' if spo2_ok else 'No'}**")
         st.write(f"- Auto-clean display: **{'On' if auto_clean else 'Off'}**")
         st.write(f"- Update interval: **{step}s**")
 
@@ -913,11 +994,14 @@ with tab1:
         # Flag event log moved here (less important than alarms)
         st.markdown("### 🧾 Flag Event Log ")
         log_df = pd.DataFrame(st.session_state.flag_log)
-        flag_cols = ["hr_out_of_range", "hyd_out_of_range", "hr_artifact", "hr_missing", "hyd_missing"]
+        flag_cols = ["hr_out_of_range", "hyd_out_of_range", "spo2_out_of_range", "hr_artifact", "hr_missing", "hyd_missing", "spo2_missing"]
 
-        events_df = log_df[log_df[flag_cols].any(axis=1)].copy()
-        events_df = events_df.iloc[::-1]  # newest first
-        st.dataframe(events_df.head(25), use_container_width=True, hide_index=True)
+        if len(log_df) > 0:
+            events_df = log_df[log_df[flag_cols].any(axis=1)].copy()
+            events_df = events_df.iloc[::-1]  # newest first
+            st.dataframe(events_df.head(25), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No flag events yet.")
 
         # Keep transitions in an expander (optional)
         with st.expander("🔁 Flag transitions (Last 12)"):
@@ -927,7 +1011,7 @@ with tab1:
             else:
                 st.caption("No transitions yet.")
 
-    # Profile summary expander (new change ~918)
+    # Profile summary expander
     with st.expander("👤 Your Profile Summary", expanded=False):
         prof_col1, prof_col2, prof_col3 = st.columns(3)
         with prof_col1:
@@ -961,10 +1045,12 @@ with tab2:
     # Build HR signals for plotting
     df_window["hr_used"] = df_window["hr_bpm_clean"] if auto_clean else df_window["hr_bpm_raw"]
     df_window["hr_used_sm"] = apply_smoothing(df_window["hr_used"])
-    df_window["hr_raw_sm"] = apply_smoothing(df_window["hr_bpm_raw"])
 
-    # Build hydration smoothed column for plotting (avoids px.line label weirdness)
+    # Build hydration smoothed column for plotting
     df_window["hyd_sm"] = apply_smoothing(df_window["hydration_ui_0to1"])
+
+    # Build blood oxygen smoothed column for plotting
+    df_window["spo2_sm"] = apply_smoothing(df_window["spo2_percent"])
 
     # Pull matching saved flags for markers (so chart markers match what’s logged)
     log_df = pd.DataFrame(st.session_state.flag_log)
@@ -974,66 +1060,90 @@ with tab2:
     if len(log_window) > 0:
         log_window["timestamp_live"] = pd.to_datetime(log_window["timestamp_live"])
 
-    left, right = st.columns(2)
+    # Heart rate chart
+    st.markdown("### Heart Rate Trend")
+    hr_fig = px.line(
+        df_window,
+        x="timestamp_live",
+        y="hr_used_sm",
+        title="Heart Rate (recent)",
+        labels={"hr_used_sm": "HR (bpm)", "timestamp_live": "Time"},
+    )
 
-    with left:
-        # HR chart (smoothed)
-        # Single-line HR plot only (no overlay)
-        hr_fig = px.line(
-            df_window,
-            x="timestamp_live",
-            y="hr_used_sm",
-            title="Heart Rate (recent)",
-            labels={"hr_used_sm": "HR (bpm)", "timestamp_live": "Time"},
-        )
+    # Marker points from saved flag log (not baseline flags)
+    if show_flag_markers and len(log_window) > 0:
+        pts = log_window[
+            (log_window["hr_out_of_range"] == 1)
+            | (log_window["hr_artifact"] == 1)
+            | (log_window["hr_missing"] == 1)
+        ].copy()
 
-        # Marker points from saved flag log (not baseline flags)
-        if show_flag_markers and len(log_window) > 0:
-            pts = log_window[
-                (log_window["hr_out_of_range"] == 1)
-                | (log_window["hr_artifact"] == 1)
-                | (log_window["hr_missing"] == 1)
-            ].copy()
+        if len(pts) > 0:
+            s = px.scatter(
+                pts,
+                x="timestamp_live",
+                y="hr_bpm_raw",
+                hover_data=["hr_out_of_range", "hr_artifact", "hr_missing"],
+            ).data[0]
+            s.name = "Flagged HR points (saved)"
+            hr_fig.add_trace(s)
 
-            if len(pts) > 0:
-                s = px.scatter(
-                    pts,
-                    x="timestamp_live",
-                    y="hr_bpm_raw",
-                    hover_data=["hr_out_of_range", "hr_artifact", "hr_missing"],
-                ).data[0]
-                s.name = "Flagged HR points (saved)"
-                hr_fig.add_trace(s)
+    hr_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), height=320)
+    st.plotly_chart(hr_fig, use_container_width=True)
 
-        hr_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(hr_fig, use_container_width=True)
+    # Hydration chart
+    st.markdown("### Hydration Trend")
+    hy_fig = px.line(
+        df_window,
+        x="timestamp_live",
+        y="hyd_sm",
+        title="Hydration (recent)",
+        labels={"timestamp_live": "Time", "hyd_sm": "Hydration (0–1)"},
+    )
 
-    with right:
-        # Hydration chart (smoothed)
-        hy_fig = px.line(
-            df_window,
-            x="timestamp_live",
-            y="hyd_sm",
-            title="Hydration (recent)",
-            labels={"timestamp_live": "Time", "hyd_sm": "Hydration (0–1)"},
-        )
+    # Hydration markers from saved log
+    if show_flag_markers and len(log_window) > 0:
+        pts2 = log_window[(log_window["hyd_out_of_range"] == 1) | (log_window["hyd_missing"] == 1)].copy()
 
-        # Hydration markers from saved log
-        if show_flag_markers and len(log_window) > 0:
-            pts2 = log_window[(log_window["hyd_out_of_range"] == 1) | (log_window["hyd_missing"] == 1)].copy()
+        if len(pts2) > 0:
+            s2 = px.scatter(
+                pts2,
+                x="timestamp_live",
+                y="hydration_0to1",
+                hover_data=["hyd_out_of_range", "hyd_missing"],
+            ).data[0]
+            s2.name = "Flagged hydration points (saved)"
+            hy_fig.add_trace(s2)
 
-            if len(pts2) > 0:
-                s2 = px.scatter(
-                    pts2,
-                    x="timestamp_live",
-                    y="hydration_0to1",
-                    hover_data=["hyd_out_of_range", "hyd_missing"],
-                ).data[0]
-                s2.name = "Flagged hydration points (saved)"
-                hy_fig.add_trace(s2)
+    hy_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), height=320)
+    st.plotly_chart(hy_fig, use_container_width=True)
 
-        hy_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(hy_fig, use_container_width=True)
+    # Blood oxygen chart
+    st.markdown("### Blood Oxygen Trend")
+    spo2_fig = px.line(
+        df_window,
+        x="timestamp_live",
+        y="spo2_sm",
+        title="Blood Oxygen (recent)",
+        labels={"timestamp_live": "Time", "spo2_sm": "SpO₂ (%)"},
+    )
+
+    # Blood oxygen markers from saved log
+    if show_flag_markers and len(log_window) > 0:
+        pts3 = log_window[(log_window["spo2_out_of_range"] == 1) | (log_window["spo2_missing"] == 1)].copy()
+
+        if len(pts3) > 0:
+            s3 = px.scatter(
+                pts3,
+                x="timestamp_live",
+                y="spo2_percent",
+                hover_data=["spo2_out_of_range", "spo2_missing"],
+            ).data[0]
+            s3.name = "Flagged SpO₂ points (saved)"
+            spo2_fig.add_trace(s3)
+
+    spo2_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), height=320)
+    st.plotly_chart(spo2_fig, use_container_width=True)
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.caption("Markers come from your saved flag log, so the chart matches what is being recorded.")
@@ -1056,7 +1166,10 @@ with tab3:
     ev_df = pd.DataFrame(st.session_state.event_log)
 
     st.markdown("**Per-sample flag log (latest 50):**")
-    st.dataframe(log_df.iloc[::-1].head(50), use_container_width=True, hide_index=True)
+    if len(log_df) > 0:
+        st.dataframe(log_df.iloc[::-1].head(50), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No samples logged yet.")
 
     st.markdown("**Flag transition log (latest 50):**")
     if len(ev_df) > 0:
@@ -1071,7 +1184,7 @@ with tab3:
 
     with cdl1:
         # Download just the current window of the log (matches the chart window concept)
-        window_log = log_df[(log_df["sample"] >= max(0, i - int(window_s))) & (log_df["sample"] <= i)].copy()
+        window_log = log_df[(log_df["sample"] >= max(0, i - int(window_s))) & (log_df["sample"] <= i)].copy() if len(log_df) > 0 else pd.DataFrame()
 
         st.download_button(
             "⬇️ Download current window flag log (CSV)",
