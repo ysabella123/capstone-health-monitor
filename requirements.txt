@@ -1,5 +1,7 @@
-streamlit
+cryptography
+bleak
 pandas
 numpy
+streamlit
 plotly
 openpyxl
