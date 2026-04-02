@@ -17,60 +17,70 @@ import plotly.express as px  # interactive charts
 import os  # for file path operations
 import base64  # for encoding data (if needed for downloads or BLE transmission)
 import json  # for saving logs or configs (if implemented)
-from cryptography.fernet import Fernet  # for data encryption (if implemented)
-from cryptography.hazmat.primitives import hashes  # for key hashing if needed
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC  # for key derivation if needed    
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # for encryption if needed
-from cryptography.hazmat.backends import default_backend  # for encryption backend
+
+CRYPTO_AVAILABLE = True
+try:
+    from cryptography.fernet import Fernet  # for data encryption (if implemented)
+    from cryptography.hazmat.primitives import hashes  # for key hashing if needed
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC  # for key derivation if needed
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # for encryption if needed
+    from cryptography.hazmat.backends import default_backend  # for encryption backend
+except Exception as e:
+    CRYPTO_AVAILABLE = False
+    Fernet = None
+    hashes = None
+    PBKDF2HMAC = None
+    Cipher = None
+    algorithms = None
+    modes = None
+    default_backend = None
+    print(f"Cryptography import not available: {e}")
 
 import asyncio
 import threading
 import queue
-from bleak import BleakScanner, BleakClient
+
+BLE_AVAILABLE = True
+try:
+    from bleak import BleakScanner, BleakClient
+except Exception as e:
+    BLE_AVAILABLE = False
+    BleakScanner = None
+    BleakClient = None
+    print(f"BLE import not available: {e}")
+
 import sys
 import os
 from pathlib import Path
 
 # ============================================================
-# CRITICAL: Import from subfolder - CORRECTED VERSION
+# BLE / receive1 setup
 # ============================================================
 
 # Get the current script's directory
 current_dir = Path(__file__).resolve().parent
 print(f"📁 Script directory: {current_dir}")
 
-# Look for receive1.py in the same folder as this app file
+receive1 = None
 receive1_file = current_dir / "receive1.py"
 print(f"🔧 Looking for receive1.py at: {receive1_file}")
 
-if receive1_file.exists():
-    print(f"✅ Found receive1.py at: {receive1_file}")
-    if str(current_dir) not in sys.path:
-        sys.path.insert(0, str(current_dir))
-        print(f"✅ Added {current_dir} to Python path")
+if BLE_AVAILABLE and receive1_file.exists():
+    try:
+        if str(current_dir) not in sys.path:
+            sys.path.insert(0, str(current_dir))
+            print(f"✅ Added {current_dir} to Python path")
+        import receive1
+        print(f"✅ Successfully imported receive1 from: {receive1.__file__}")
+        print(f"Available in receive1: {[x for x in dir(receive1) if not x.startswith('_')]}")
+    except Exception as e:
+        print(f"⚠️ Import error: {e}")
+        receive1 = None
 else:
-    print(f"⚠️ receive1.py not found at {receive1_file}")
-    receive1_file = Noneh")
-
-# Now import receive1 (correct name - with 'c')
-try:
-    import receive1
-    print(f"✅ Successfully imported receive1 from: {receive1.__file__}")
-    print(f"Available in receive1: {[x for x in dir(receive1) if not x.startswith('_')]}")
-except ImportError as e:
-    print(f"❌ Import error: {e}")
-    print("Attempting alternative import method...")
-    
-    # Alternative: use importlib for direct loading
-    if receive1_file.exists():
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("receive1", receive1_file)
-        receive1 = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(receive1)
-        print(f"✅ Loaded via direct path: {receive1}")
-    else:
-        print(f"❌ Cannot find receive1.py")
-        sys.exit(1)
+    if not BLE_AVAILABLE:
+        print("⚠️ BLE not available on this deployment")
+    if not receive1_file.exists():
+        print(f"⚠️ receive1.py not found at {receive1_file}")
 
 
 # ============================================================
@@ -342,6 +352,8 @@ class ContinuousHealthMonitor:
 
 class HealthDataEncryptor:
     def __init__(self, key_file=None):
+        if not CRYPTO_AVAILABLE:
+            raise RuntimeError("Cryptography package is not installed on this deployment")
         self.backend = default_backend()
         self.key = self._load_or_create_key(key_file)
         self.cipher_suite = Fernet(self.key)
@@ -410,6 +422,8 @@ class HealthDataEncryptor:
     
 class PasswordBasedEncryptor:
     def __init__(self, password, salt=None):
+        if not CRYPTO_AVAILABLE:
+            raise RuntimeError("Cryptography package is not installed on this deployment")
         self.salt = salt or os.urandom(16)
         self.key = self._derive_key(password, self.salt)
 
@@ -631,6 +645,10 @@ def parse_battery_streamlit(sender, data: bytearray):
 async def run_ble_receiver():
     """Run the BLE receiver using receive1 functions"""
     global ble_state
+
+    if not BLE_AVAILABLE or receive1 is None:
+        ble_state["error"] = "BLE/receive1 not available on this deployment"
+        return
     
     print("Starting BLE receiver...")
     
@@ -716,6 +734,10 @@ def ble_worker():
 
 def start_ble_receiver():
     """Start the BLE receiver thread"""
+    if not BLE_AVAILABLE or receive1 is None:
+        ble_state["error"] = "BLE/receive1 not available on this deployment"
+        return False
+
     if not ble_state["running"]:
         ble_state["running"] = True
         ble_state["error"] = None
@@ -766,6 +788,9 @@ def add_ble_controls_to_sidebar():
     """Add BLE connection controls to sidebar"""
     st.sidebar.markdown("---")
     st.sidebar.title("📡 BLE Connection")
+
+    if not BLE_AVAILABLE or receive1 is None:
+        st.sidebar.warning("BLE is not available on this deployment")
     
     # BLE control buttons
     col_ble1, col_ble2 = st.sidebar.columns(2)
