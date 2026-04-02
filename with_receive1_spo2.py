@@ -39,24 +39,18 @@ from pathlib import Path
 current_dir = Path(__file__).resolve().parent
 print(f"📁 Script directory: {current_dir}")
 
-# Navigate to the hardware folder containing receive1.py
-# Path: C:\Users\amara\OneDrive\Desktop\490-491\ECE-490-491\490 Hardware code\receive1.py
-hardware_folder = current_dir / "490 Hardware code"
-print(f"🔧 Hardware folder: {hardware_folder}")
+# Look for receive1.py in the same folder as this app file
+receive1_file = current_dir / "receive1.py"
+print(f"🔧 Looking for receive1.py at: {receive1_file}")
 
-# Verify the file exists - NOTE: It's receive1.py (with 'c'), NOT reveive1.py
-receive1_file = hardware_folder / "receive1.py"
 if receive1_file.exists():
     print(f"✅ Found receive1.py at: {receive1_file}")
+    if str(current_dir) not in sys.path:
+        sys.path.insert(0, str(current_dir))
+        print(f"✅ Added {current_dir} to Python path")
 else:
-    print(f"❌ ERROR: Cannot find receive1.py at {receive1_file}")
-    print(f"Files in hardware folder: {list(hardware_folder.glob('*.py'))}")
-    sys.exit(1)
-
-# Add the hardware folder to Python path
-if str(hardware_folder) not in sys.path:
-    sys.path.insert(0, str(hardware_folder))
-    print(f"✅ Added {hardware_folder} to Python path")
+    print(f"⚠️ receive1.py not found at {receive1_file}")
+    receive1_file = Noneh")
 
 # Now import receive1 (correct name - with 'c')
 try:
