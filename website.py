@@ -859,7 +859,7 @@ def add_ble_controls_to_sidebar():
 BASE_DIR = Path(__file__).resolve().parent
 
 # Your sensor-only Excel file (must be in same folder as main.py unless you change this)
-EXCEL_FILE = BASE_DIR / "hr_hydration_training_2h_SENSOR_ONLY.xlsx"
+EXCEL_FILE = BASE_DIR / "hr_hydration_training_2h_SENSOR_ONLY_with_spo2.xlsx"
 
 # Sheet name
 SHEET = "Sheet1"
