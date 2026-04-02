@@ -1,5 +1,4 @@
-# LAST UPDATED: 03/19/2026 added blood oxygen support, personalized thresholds, and other improvements
-# Capstone Project – Live Heart Rate + Hydration + Blood Oxygen Monitoring Dashboard (Streamlit)
+# Capstone Project – Live Heart Rate + Hydration Monitoring Dashboard (Streamlit)
 
 # This app simulates a wearable monitoring dashboard using a 2-hour, 1 Hz dataset.
 
@@ -15,6 +14,70 @@ import pandas as pd  # dataframe operations + Excel loading
 import streamlit as st  # Streamlit UI framework
 import plotly.express as px  # interactive charts
 
+import os  # for file path operations
+import base64  # for encoding data (if needed for downloads or BLE transmission)
+import json  # for saving logs or configs (if implemented)
+from cryptography.fernet import Fernet  # for data encryption (if implemented)
+from cryptography.hazmat.primitives import hashes  # for key hashing if needed
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC  # for key derivation if needed    
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # for encryption if needed
+from cryptography.hazmat.backends import default_backend  # for encryption backend
+
+import asyncio
+import threading
+import queue
+from bleak import BleakScanner, BleakClient
+import sys
+import os
+from pathlib import Path
+
+# ============================================================
+# CRITICAL: Import from subfolder - CORRECTED VERSION
+# ============================================================
+
+# Get the current script's directory
+current_dir = Path(__file__).resolve().parent
+print(f"📁 Script directory: {current_dir}")
+
+# Navigate to the hardware folder containing receive1.py
+# Path: C:\Users\amara\OneDrive\Desktop\490-491\ECE-490-491\490 Hardware code\receive1.py
+hardware_folder = current_dir / "490 Hardware code"
+print(f"🔧 Hardware folder: {hardware_folder}")
+
+# Verify the file exists - NOTE: It's receive1.py (with 'c'), NOT reveive1.py
+receive1_file = hardware_folder / "receive1.py"
+if receive1_file.exists():
+    print(f"✅ Found receive1.py at: {receive1_file}")
+else:
+    print(f"❌ ERROR: Cannot find receive1.py at {receive1_file}")
+    print(f"Files in hardware folder: {list(hardware_folder.glob('*.py'))}")
+    sys.exit(1)
+
+# Add the hardware folder to Python path
+if str(hardware_folder) not in sys.path:
+    sys.path.insert(0, str(hardware_folder))
+    print(f"✅ Added {hardware_folder} to Python path")
+
+# Now import receive1 (correct name - with 'c')
+try:
+    import receive1
+    print(f"✅ Successfully imported receive1 from: {receive1.__file__}")
+    print(f"Available in receive1: {[x for x in dir(receive1) if not x.startswith('_')]}")
+except ImportError as e:
+    print(f"❌ Import error: {e}")
+    print("Attempting alternative import method...")
+    
+    # Alternative: use importlib for direct loading
+    if receive1_file.exists():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("receive1", receive1_file)
+        receive1 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(receive1)
+        print(f"✅ Loaded via direct path: {receive1}")
+    else:
+        print(f"❌ Cannot find receive1.py")
+        sys.exit(1)
+
 
 # ============================================================
 # Continuous Monitoring Logic
@@ -27,11 +90,11 @@ class ContinuousHealthMonitor:
         hr_threshold_low=30,                 # user min HR
         hr_threshold_high=220,               # user max HR
         hydration_threshold_low=0.30,        # user min hydration (0–1)
-        hydration_threshold_high=1.0,        # user max hydration (0–1)
+        hydration_threshold_high=1,          # user max hydration (0–1)
         spo2_threshold_low=95.0,             # user min blood oxygen (%)
         spo2_threshold_high=100.0,           # user max blood oxygen (%)
-        hr_hold_ticks=5,                     # how many ticks HR must persist abnormal
-        hyd_hold_ticks=2,                    # how many ticks hydration must persist abnormal
+        hr_hold_ticks=5,                     # how many ticks HR must persist abnormal 5s
+        hyd_hold_ticks=2,                    # how many ticks hydration must persist abnormal 10min
         spo2_hold_ticks=3,                   # how many ticks SpO₂ must persist abnormal
         hr_disconnect_hold_ticks=5,          # how many ticks HR missing before persistent disconnect
         hyd_disconnect_hold_ticks=5,         # how many ticks hyd missing before persistent disconnect
@@ -93,7 +156,7 @@ class ContinuousHealthMonitor:
             self.alarm_history.pop(0)
 
     def is_hr_abnormal(self, hr_value):
-        # HR abnormal means outside user min/max (but NaN is handled by disconnect logic)
+        # HR abnormal means outside user min/max (but NaN is handled by disconnect logic) (new change ~87)
         if hr_value is None or pd.isna(hr_value):
             return False
         hr_value = float(hr_value)
@@ -283,6 +346,492 @@ class ContinuousHealthMonitor:
         }
 
 
+class HealthDataEncryptor:
+    def __init__(self, key_file=None):
+        self.backend = default_backend()
+        self.key = self._load_or_create_key(key_file)
+        self.cipher_suite = Fernet(self.key)
+
+    def _load_or_create_key(self, key_file):
+        if key_file and Path(key_file).exists():
+            with open(key_file, 'rb') as f:
+                return f.read()
+        else:
+            key = Fernet.generate_key()
+            if key_file:
+                Path(key_file).parent.mkdir(parents=True, exist_ok=True)
+                with open(key_file, 'wb') as f:
+                    f.write(key)
+                st.sidebar.success(f"🔑 New encryption key saved to {key_file}")
+            return key
+    
+    def encrypt_data(self, data):
+        # Convert to JSON string if dict/DataFrame
+        if isinstance(data, dict):
+            data_str = json.dumps(data, default=str)
+        elif hasattr(data, 'to_json'):  # pandas DataFrame
+            data_str = data.to_json()
+        else:
+            data_str = str(data)
+        
+        # Encrypt
+        encrypted = self.cipher_suite.encrypt(data_str.encode())
+        return encrypted
+    
+    def decrypt_data(self, encrypted_data):
+        try:
+            decrypted = self.cipher_suite.decrypt(encrypted_data)
+            return decrypted.decode()
+        except Exception as e:
+            st.error(f"Decryption failed: {e}")
+            return None
+        
+    def encrypt_file(self, input_path, output_path=None):
+        if not output_path:
+            output_path = str(input_path) + '.encrypted'
+        
+        with open(input_path, 'rb') as f:
+            file_data = f.read()
+        
+        encrypted = self.cipher_suite.encrypt(file_data)
+        
+        with open(output_path, 'wb') as f:
+            f.write(encrypted)
+        
+        return output_path
+    
+    def decrypt_file(self, input_path, output_path=None):
+        if not output_path:
+            output_path = str(input_path).replace('.encrypted', '.decrypted')
+        
+        with open(input_path, 'rb') as f:
+            encrypted = f.read()
+        
+        decrypted = self.cipher_suite.decrypt(encrypted)
+        
+        with open(output_path, 'wb') as f:
+            f.write(decrypted)
+        
+        return output_path
+    
+class PasswordBasedEncryptor:
+    def __init__(self, password, salt=None):
+        self.salt = salt or os.urandom(16)
+        self.key = self._derive_key(password, self.salt)
+
+    def _derive_key(self, password, salt):
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+            backend=default_backend()
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        return key
+    
+    def encrypt_user_data(self, data):
+        cipher = Fernet(self.key)
+        return cipher.encrypt(json.dumps(data, default=str).encode())
+    
+    def decrypt_user_data(self, encrypted_data):
+        cipher = Fernet(self.key)
+        decrypted = cipher.decrypt(encrypted_data)
+        return json.loads(decrypted.decode())
+
+class SecureDataTransmitter:
+    def __init__(self, encryptor):
+        self.encryptor = encryptor
+
+    def prepare_for_transmission(self, data, include_metadata=False):
+        packet = {
+            'encrypted_data': self.encryptor.encrypt_data(data),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        if include_metadata:
+            # Add integrity hash
+            packet['checksum'] = self._calculate_checksum(packet['encrypted_data'])
+        
+        return packet
+    
+    def _calculate_checksum(self, data):
+        import hashlib
+        return hashlib.sha256(data).hexdigest()
+    
+    @staticmethod
+    def verify_packet(packet):
+        if 'checksum' in packet:
+            import hashlib
+            calculated = hashlib.sha256(packet['encrypted_data']).hexdigest()
+            return calculated == packet['checksum']
+        return True
+
+# ============================================================
+# BLE Receiver Integration
+# ============================================================
+
+# Create a queue for passing data from BLE thread to Streamlit
+ble_data_queue = queue.Queue()
+
+# Global BLE state
+ble_state = {
+    "connected": False,
+    "heart_rate": None,
+    "hydration": None,
+    "spo2": None,
+    "battery": None,
+    "uptime": None,
+    "last_update": None,
+    "device_name": "",
+    "device_addr": "",
+    "running": False,
+    "error": None
+}
+
+# def ble_worker():
+#     """Run the BLE receiver in a separate thread"""
+#     try:
+#         # Use asyncio to run the main BLE function
+#         asyncio.run(run_ble_receiver())
+#     except Exception as e:
+#         ble_state["error"] = str(e)
+#         ble_state["running"] = False
+
+# async def run_ble_receiver():
+#     """Modified version of receive1's main function that updates our state"""
+#     global ble_state
+    
+#     while ble_state["running"]:
+#         device = await receive1.find_device()
+#         if device is None:
+#             # No device found, wait and retry
+#             await asyncio.sleep(2)
+#             continue
+        
+#         try:
+#             async with BleakClient(device, timeout=15.0) as client:
+#                 ble_state["connected"] = True
+#                 ble_state["device_name"] = device.name or device.address
+#                 ble_state["device_addr"] = device.address
+#                 ble_state["last_update"] = time.time()
+                
+#                 # Subscribe to characteristics
+#                 subs = [
+#                     (receive1.CHARACTERISTIC_UUID, parse_combined, "Combined"),
+#                     (receive1.HEART_RATE_CHAR_UUID, parse_heart_rate_streamlit, "Heart Rate"),
+#                     (receive1.HYDRATION_CHAR_UUID, parse_hydration_streamlit, "Hydration"),
+#                     (receive1.BATTERY_CHAR_UUID, parse_battery_streamlit, "Battery"),
+#                 ]
+                
+#                 for uuid, handler, label in subs:
+#                     try:
+#                         await client.start_notify(uuid, handler)
+#                     except Exception as e:
+#                         print(f"Could not subscribe to {label}: {e}")
+                
+#                 # Keep connection alive
+#                 while ble_state["running"] and client.is_connected:
+#                     await asyncio.sleep(1)
+                    
+#                 ble_state["connected"] = False
+                
+#         except Exception as e:
+#             ble_state["error"] = str(e)
+#             ble_state["connected"] = False
+#             await asyncio.sleep(3)
+
+def parse_combined_streamlit(sender, data: bytearray):
+    """Parse combined data and update Streamlit state"""
+    try:
+        text = data.decode("utf-8").strip()
+        ble_state["last_update"] = time.time()
+        
+        for part in text.split(","):
+            part = part.strip()
+            if part.startswith("Uptime:"):
+                ble_state["uptime"] = part[7:]
+            elif part.startswith("HR:"):
+                ble_state["heart_rate"] = float(part[3:])
+            elif part.startswith("Hyd:"):
+                ble_state["hydration"] = float(part[4:].rstrip("%"))
+            elif part.startswith("SpO2:"):
+                ble_state["spo2"] = float(part[5:].rstrip("%"))
+            elif part.startswith("SpO₂:"):
+                ble_state["spo2"] = float(part[5:].rstrip("%"))
+        
+        # Also put in queue for Streamlit to process
+        ble_data_queue.put({
+            "type": "combined",
+            "data": ble_state.copy()
+        })
+        
+    except Exception as e:
+        print(f"Parse error: {e}")
+
+def parse_heart_rate_streamlit(sender, data: bytearray):
+    """Parse heart rate data"""
+    try:
+        import struct
+        if len(data) == 2:
+            heart_rate = float(data[1])
+        elif len(data) == 4:
+            heart_rate = struct.unpack("<f", data)[0]
+        else:
+            return
+            
+        if 0 < heart_rate < 300:
+            ble_state["heart_rate"] = heart_rate
+            ble_state["last_update"] = time.time()
+            ble_data_queue.put({
+                "type": "heart_rate",
+                "value": heart_rate,
+                "timestamp": time.time()
+            })
+    except Exception as e:
+        print(f"HR parse error: {e}")
+
+def parse_hydration_streamlit(sender, data: bytearray):
+    """Parse hydration data"""
+    try:
+        hydration = float(data.decode("utf-8").strip().rstrip("%"))
+        ble_state["hydration"] = hydration
+        ble_state["last_update"] = time.time()
+        ble_data_queue.put({
+            "type": "hydration",
+            "value": hydration,
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        print(f"Hydration parse error: {e}")
+
+def parse_spo2_streamlit(sender, data: bytearray):
+    """Parse blood oxygen data"""
+    try:
+        spo2 = float(data.decode("utf-8").strip().rstrip("%"))
+        ble_state["spo2"] = spo2
+        ble_state["last_update"] = time.time()
+        ble_data_queue.put({
+            "type": "spo2",
+            "value": spo2,
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        print(f"SpO₂ parse error: {e}")
+
+def parse_battery_streamlit(sender, data: bytearray):
+    """Parse battery data"""
+    try:
+        if len(data) >= 1:
+            battery = int(data[0])
+            ble_state["battery"] = battery
+            ble_state["last_update"] = time.time()
+            ble_data_queue.put({
+                "type": "battery",
+                "value": battery,
+                "timestamp": time.time()
+            })
+    except Exception as e:
+        print(f"Battery parse error: {e}")
+
+async def run_ble_receiver():
+    """Run the BLE receiver using receive1 functions"""
+    global ble_state
+    
+    print("Starting BLE receiver...")
+    
+    while ble_state["running"]:
+        try:
+            # Use receive1's find_device function
+            device = await receive1.find_device()
+            
+            if device is None:
+                print("Device not found, waiting...")
+                await asyncio.sleep(2)
+                continue
+            
+            print(f"Found device: {device.name or device.address}")
+            
+            async with BleakClient(device, timeout=15.0) as client:
+                ble_state["connected"] = True
+                ble_state["device_name"] = device.name or device.address
+                ble_state["device_addr"] = device.address
+                ble_state["last_update"] = time.time()
+                ble_state["error"] = None
+                
+                print(f"Connected to {ble_state['device_name']}")
+                
+                # Use constants from receive1
+                # Check if the constants exist, if not, use defaults
+                try:
+                    combined_uuid = getattr(receive1, 'CHARACTERISTIC_UUID', "0000abcd-0000-1000-8000-00805f9b34fb")
+                    hr_uuid = getattr(receive1, 'HEART_RATE_CHAR_UUID', "00002a37-0000-1000-8000-00805f9b34fb")
+                    hyd_uuid = getattr(receive1, 'HYDRATION_CHAR_UUID', "abcdef04-1234-5678-9abc-def012345678")
+                    spo2_uuid = getattr(receive1, 'SPO2_CHAR_UUID', None)
+                    batt_uuid = getattr(receive1, 'BATTERY_CHAR_UUID', "00002a19-0000-1000-8000-00805f9b34fb")
+                except:
+                    combined_uuid = "0000abcd-0000-1000-8000-00805f9b34fb"
+                    hr_uuid = "00002a37-0000-1000-8000-00805f9b34fb"
+                    hyd_uuid = "abcdef04-1234-5678-9abc-def012345678"
+                    spo2_uuid = None
+                    batt_uuid = "00002a19-0000-1000-8000-00805f9b34fb"
+                
+                subs = [
+                    (combined_uuid, parse_combined_streamlit, "Combined"),
+                    (hr_uuid, parse_heart_rate_streamlit, "Heart Rate"),
+                    (hyd_uuid, parse_hydration_streamlit, "Hydration"),
+                    (batt_uuid, parse_battery_streamlit, "Battery"),
+                ]
+
+                if spo2_uuid:
+                    subs.append((spo2_uuid, parse_spo2_streamlit, "SpO₂"))
+                
+                for uuid, handler, label in subs:
+                    try:
+                        await client.start_notify(uuid, handler)
+                        print(f"Subscribed to {label}")
+                    except Exception as e:
+                        print(f"Could not subscribe to {label}: {e}")
+                
+                # Keep connection alive
+                while ble_state["running"] and client.is_connected:
+                    await asyncio.sleep(1)
+                    
+                ble_state["connected"] = False
+                print("Disconnected")
+                
+        except Exception as e:
+            ble_state["error"] = str(e)
+            ble_state["connected"] = False
+            print(f"Connection error: {e}")
+            await asyncio.sleep(3)
+
+def ble_worker():
+    """Run the BLE receiver in a separate thread"""
+    try:
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        loop.run_until_complete(run_ble_receiver())
+        loop.close()
+    except Exception as e:
+        ble_state["error"] = str(e)
+        ble_state["running"] = False
+        print(f"BLE worker error: {e}")
+
+def start_ble_receiver():
+    """Start the BLE receiver thread"""
+    if not ble_state["running"]:
+        ble_state["running"] = True
+        ble_state["error"] = None
+        ble_thread = threading.Thread(target=ble_worker, daemon=True)
+        ble_thread.start()
+        return True
+    return False
+
+def stop_ble_receiver():
+    """Stop the BLE receiver"""
+    ble_state["running"] = False
+    ble_state["connected"] = False
+
+def send_command_to_device(command):
+    """Send a command to the ESP32 via BLE"""
+    if ble_state["connected"]:
+        ble_data_queue.put({
+            "type": "command",
+            "command": command
+        })
+        return True
+    return False
+
+def process_ble_data():
+    """Process queued BLE data and update the health monitor"""
+    try:
+        while not ble_data_queue.empty():
+            data = ble_data_queue.get_nowait()
+            
+            if data["type"] == "heart_rate":
+                # Update monitor with real HR data
+                current_time = datetime.now()
+                if "monitor" in st.session_state:
+                    st.session_state.monitor.process_hr(current_time, data["value"])
+                
+            elif data["type"] == "hydration":
+                # Update monitor with real hydration data
+                current_time = datetime.now()
+                # Convert percentage to 0-1 scale if needed
+                hydration_value = data["value"] / 100.0 if data["value"] > 1 else data["value"]
+                if "monitor" in st.session_state:
+                    st.session_state.monitor.process_hydration(current_time, hydration_value)
+                
+    except queue.Empty:
+        pass
+
+def add_ble_controls_to_sidebar():
+    """Add BLE connection controls to sidebar"""
+    st.sidebar.markdown("---")
+    st.sidebar.title("📡 BLE Connection")
+    
+    # BLE control buttons
+    col_ble1, col_ble2 = st.sidebar.columns(2)
+    with col_ble1:
+        if st.button("🔌 Connect BLE", use_container_width=True):
+            if start_ble_receiver():
+                st.sidebar.success("BLE receiver started!")
+            else:
+                st.sidebar.warning("BLE receiver already running")
+    
+    with col_ble2:
+        if st.button("⏸ Disconnect BLE", use_container_width=True):
+            stop_ble_receiver()
+            st.sidebar.info("BLE receiver stopped")
+    
+    # Display BLE status
+    if ble_state["connected"]:
+        st.sidebar.success(f"✅ Connected to: {ble_state['device_name']}")
+        st.sidebar.write(f"📱 Address: {ble_state['device_addr']}")
+        if ble_state["last_update"]:
+            ago = time.time() - ble_state["last_update"]
+            if ago < 5:
+                st.sidebar.info(f"📊 Last update: {ago:.1f}s ago")
+            else:
+                st.sidebar.warning(f"⚠️ Last update: {ago:.1f}s ago")
+    else:
+        if ble_state["running"]:
+            st.sidebar.info("🔍 Searching for device...")
+        else:
+            st.sidebar.info("❌ Not connected")
+        
+        if ble_state["error"]:
+            st.sidebar.error(f"Error: {ble_state['error']}")
+    
+    # BLE Command controls
+    if ble_state["connected"]:
+        st.sidebar.markdown("### Device Commands")
+        col_cmd1, col_cmd2, col_cmd3 = st.sidebar.columns(3)
+        
+        with col_cmd1:
+            if st.button("🔔 Vibrate ON", use_container_width=True):
+                if send_command_to_device("MOTOR_ON"):
+                    st.sidebar.success("Command sent")
+                else:
+                    st.sidebar.warning("Not connected")
+        
+        with col_cmd2:
+            if st.button("🔕 Vibrate OFF", use_container_width=True):
+                if send_command_to_device("MOTOR_OFF"):
+                    st.sidebar.success("Command sent")
+                else:
+                    st.sidebar.warning("Not connected")
+        
+        with col_cmd3:
+            if st.button("🔄 Reset", use_container_width=True):
+                if send_command_to_device("RESET"):
+                    st.sidebar.success("Command sent")
+                else:
+                    st.sidebar.warning("Not connected")
+
 # ============================================================
 # Config (paths + dataset)
 # ============================================================
@@ -291,7 +840,7 @@ class ContinuousHealthMonitor:
 BASE_DIR = Path(__file__).resolve().parent
 
 # Your sensor-only Excel file (must be in same folder as main.py unless you change this)
-EXCEL_FILE = BASE_DIR / "hr_hydration_training_2h_SENSOR_ONLY_with_spo2.xlsx"
+EXCEL_FILE = BASE_DIR / "hr_hydration_training_2h_SENSOR_ONLY.xlsx"
 
 # Sheet name
 SHEET = "Sheet1"
@@ -414,7 +963,7 @@ weight = st.sidebar.number_input("Weight (kg)", min_value=20.0, max_value=250.0,
 height = st.sidebar.number_input("Height (cm)", min_value=100.0, max_value=230.0, value=170.0, key="height")
 gender = st.sidebar.selectbox("Gender", ["Female", "Male", "Other"], key="gender")
 
-# Calculate personalized thresholds based on profile
+# Calculate personalized thresholds based on profile (new change ~396)
 @st.cache_data
 def calculate_personalized_thresholds(age, weight, height, gender):
     """Calculate personalized HR and hydration thresholds"""
@@ -448,8 +997,8 @@ def calculate_personalized_thresholds(age, weight, height, gender):
     # Dehydration threshold: loss of 2% of body weight from water
     dehydration_threshold = 1.0 - (0.02 * weight / total_body_water_liters)
     
-    # Overhydration threshold (rare, but kept inside 0–1 UI scale)
-    overhydration_threshold = 1.0
+    # Overhydration threshold (rare, but for safety)
+    overhydration_threshold = 1.05  # 5% above normal
     
     return {
         'hr_max': hr_max,
@@ -473,16 +1022,36 @@ with st.sidebar.expander("Your Personalized Metrics", expanded=False):
     st.write(f"**Dehydration threshold:** {personalized['dehydration_threshold']:.2f}")
 
 
+# # Preset modes only set default values in the sidebar
+# mode = st.sidebar.selectbox("Profile", ["General", "Athlete", "Sleep", "Disorder-safe (flag only)"], index=0)
+
+# # Preset defaults
+# if mode == "General":
+#     default_hr_min, default_hr_max, default_jump = 45, 185, 40
+#     default_hyd_min, default_hyd_max = 0.30, 1.00
+#     auto_clean_default = True
+# if mode == "Athlete":
+#     default_hr_min, default_hr_max, default_jump = 50, 205, 50
+#     default_hyd_min, default_hyd_max = 0.20, 1.00
+#     auto_clean_default = True
+# elif mode == "Sleep":
+#     default_hr_min, default_hr_max, default_jump = 30, 100, 30
+#     default_hyd_min, default_hyd_max = 0.30, 1.00
+#     auto_clean_default = True
+# else:
+#     default_hr_min, default_hr_max, default_jump = 45, 220, 60
+#     default_hyd_min, default_hyd_max = 0.10, 1.00
+#     auto_clean_default = False
+default_jump = 40
+auto_clean_default = True
 # ============================================================
 # Thresholds - NOW USING PERSONALIZED VALUES AS DEFAULTS
 # ============================================================
-st.sidebar.markdown("### Alert Thresholds")
+st.sidebar.markdown("### Alert Thresholds") #new change ~482
 
 # Option to use personalized defaults or manual
-use_personalized = st.sidebar.checkbox("Use personalized thresholds", value=True)
-
-default_jump = 40
-auto_clean_default = True
+use_personalized = st.sidebar.checkbox("Use personalized thresholds", value=True, 
+                                       help="Base thresholds on your age/gender/weight")
 
 if use_personalized:
     # Use calculated personalized values
@@ -513,6 +1082,34 @@ else:
     default_jump = 40  # Default jump threshold
     auto_clean_default = True
 
+with st.sidebar.expander("Set Thresholds Manually", expanded=not use_personalized):
+    hr_min = st.number_input("Heart Rate min (bpm)", 
+                            value=float(default_hr_min), 
+                            step=1.0,
+                            help="Below this triggers low HR alert")
+    
+    hr_max = st.number_input("Heart Rate max (bpm)", 
+                            value=float(default_hr_max), 
+                            step=1.0,
+                            help="Above this triggers high HR alert")
+
+    hyd_min = st.number_input("Hydration min (0–1)", 
+                             value=float(default_hyd_min), 
+                             step=0.05, 
+                             format="%.2f",
+                             help="Below this indicates dehydration")
+    
+    hyd_max = st.number_input("Hydration max (0–1)", 
+                             value=float(default_hyd_max), 
+                             step=0.05, 
+                             format="%.2f",
+                             help="Above this may indicate overhydration")
+
+    max_delta = st.number_input("Max HR jump (bpm/s)", 
+                               value=40.0, 
+                               step=1.0,
+                               help="Sudden jumps above this are flagged as artifacts")
+
 # User-defined thresholds (this is what you wanted: user chooses min/max)
 with st.sidebar.expander("Thresholds", expanded=True):
     hr_min = st.number_input("Heart Rate min (bpm)", value=float(default_hr_min), step=1.0)
@@ -521,7 +1118,6 @@ with st.sidebar.expander("Thresholds", expanded=True):
     hyd_min = st.number_input("Hydration min (0–1)", value=float(default_hyd_min), step=0.05, format="%.2f")
     hyd_max = st.number_input("Hydration max (0–1)", value=float(default_hyd_max), step=0.05, format="%.2f")
 
-    # Blood oxygen min/max chosen by the user
     spo2_min = st.number_input("Blood Oxygen min (%)", value=95.0, step=1.0)
     spo2_max = st.number_input("Blood Oxygen max (%)", value=100.0, step=1.0)
 
@@ -549,14 +1145,14 @@ with st.sidebar.expander("Display", expanded=False):
     )
 
     # Window length for plotting (how much history to show)
-    window_s = st.slider("Chart window (seconds)", 60, 900, 60, step=30)
+    window_s = st.slider("Chart window (seconds)", 60, 900, 60, step=30)  # Make sure this exists
 
     # Smoothing affects plot appearance only (not logged values)
     smoothing = st.selectbox("Smoothing", ["None", "Moving average (5s)", "Moving average (15s)"], index=0)
 
     # Optional overlay + marker toggles
     show_flag_markers = st.checkbox("Show outlier/disconnect markers", value=True)
-
+    
 # Sidebar dataset info
 st.sidebar.markdown("---")
 st.sidebar.caption("Data")
@@ -564,6 +1160,138 @@ st.sidebar.write("File:", f"`{EXCEL_FILE.name}`")
 st.sidebar.write("Sheet:", f"`{SHEET}`")
 st.sidebar.write("Rows:", f"`{len(df):,}`")
 
+# ============================================================
+# Encryption Settings (Add this after dataset info in sidebar)
+# ============================================================
+
+st.sidebar.markdown("---")
+st.sidebar.title("🔒 Security Settings")
+
+# Initialize encryption in session state if not already done
+if "encryption_enabled" not in st.session_state:
+    st.session_state.encryption_enabled = False
+
+# Encryption toggle
+enable_encryption = st.sidebar.checkbox(
+    "Enable data encryption", 
+    value=st.session_state.encryption_enabled,
+    help="Encrypt sensitive health data before saving"
+)
+
+# Update session state
+st.session_state.encryption_enabled = enable_encryption
+
+if enable_encryption:
+    encryption_method = st.sidebar.radio(
+        "Encryption method",
+        ["File-based key", "Password-based"],
+        help="File-based: Uses key file (automatic). Password-based: Requires password"
+    )
+    
+    # Key file path
+    key_path = BASE_DIR / "encryption_key.key"
+    
+    if encryption_method == "Password-based":
+        enc_password = st.sidebar.text_input("🔑 Encryption password", type="password")
+        if enc_password and len(enc_password) >= 8:
+            try:
+                if 'user_encryptor' not in st.session_state:
+                    st.session_state.user_encryptor = PasswordBasedEncryptor(enc_password)
+                st.sidebar.success("✅ Password-based encryption ready")
+            except Exception as e:
+                st.sidebar.error(f"Error: {e}")
+        elif enc_password:
+            st.sidebar.warning("Password must be at least 8 characters")
+    else:
+        # Initialize file-based encryptor
+        try:
+            if 'encryptor' not in st.session_state:
+                st.session_state.encryptor = HealthDataEncryptor(key_file=key_path)
+            
+            # Show key status
+            if key_path.exists():
+                st.sidebar.success(f"✅ Key file loaded: `{key_path.name}`")
+            else:
+                st.sidebar.info(f"🔑 New key will be created at: `{key_path.name}`")
+        except Exception as e:
+            st.sidebar.error(f"Encryption error: {e}")
+    
+    # Initialize transmitter if encryptor exists
+    if 'encryptor' in st.session_state and 'transmitter' not in st.session_state:
+        st.session_state.transmitter = SecureDataTransmitter(st.session_state.encryptor)
+
+# ============================================================
+# BLE Connection Section - WITH UNIQUE KEYS
+# ============================================================
+
+st.sidebar.markdown("---")
+st.sidebar.title("📡 BLE Connection")
+
+# BLE control buttons - ADD UNIQUE KEYS
+col_ble1, col_ble2 = st.sidebar.columns(2)
+with col_ble1:
+    if st.button("🔌 Connect BLE", use_container_width=True, key="ble_connect_button"):
+        if start_ble_receiver():
+            st.sidebar.success("BLE receiver started!")
+        else:
+            st.sidebar.warning("BLE receiver already running")
+
+with col_ble2:
+    if st.button("⏸ Disconnect BLE", use_container_width=True, key="ble_disconnect_button"):
+        stop_ble_receiver()
+        st.sidebar.info("BLE receiver stopped")
+
+# Display BLE status
+if ble_state["connected"]:
+    st.sidebar.success(f"✅ Connected to: {ble_state['device_name']}")
+    st.sidebar.write(f"📱 Address: {ble_state['device_addr']}")
+    if ble_state["last_update"]:
+        ago = time.time() - ble_state["last_update"]
+        if ago < 5:
+            st.sidebar.info(f"📊 Last update: {ago:.1f}s ago")
+        else:
+            st.sidebar.warning(f"⚠️ Last update: {ago:.1f}s ago")
+else:
+    if ble_state["running"]:
+        st.sidebar.info("🔍 Searching for device...")
+    else:
+        st.sidebar.info("❌ Not connected")
+    
+    if ble_state["error"]:
+        st.sidebar.error(f"Error: {ble_state['error']}")
+
+# BLE Command controls - ADD UNIQUE KEYS
+if ble_state["connected"]:
+    st.sidebar.markdown("### Device Commands")
+    col_cmd1, col_cmd2, col_cmd3 = st.sidebar.columns(3)
+    
+    with col_cmd1:
+        if st.button("🔔 Vibrate ON", use_container_width=True, key="ble_vibrate_on_button"):
+            if send_command_to_device("MOTOR_ON"):
+                st.sidebar.success("Command sent")
+            else:
+                st.sidebar.warning("Not connected")
+    
+    with col_cmd2:
+        if st.button("🔕 Vibrate OFF", use_container_width=True, key="ble_vibrate_off_button"):
+            if send_command_to_device("MOTOR_OFF"):
+                st.sidebar.success("Command sent")
+            else:
+                st.sidebar.warning("Not connected")
+    
+    with col_cmd3:
+        if st.button("🔄 Reset", use_container_width=True, key="ble_reset_button"):
+            if send_command_to_device("RESET"):
+                st.sidebar.success("Command sent")
+            else:
+                st.sidebar.warning("Not connected")
+
+# ============================================================
+# Main app - ADD BLE DATA PROCESSING HERE
+# ============================================================
+
+# Process BLE data before any other operations
+process_ble_data()
 
 # ============================================================
 # Session state (stream index + running + live timestamp + logs)
@@ -599,10 +1327,6 @@ if "prev_hr_for_flags" not in st.session_state:
 
 if "prev_dt_for_flags" not in st.session_state:
     st.session_state.prev_dt_for_flags = None
-
-# Prevent duplicate logging when Streamlit reruns without advancing the sample
-if "last_logged_sample" not in st.session_state:
-    st.session_state.last_logged_sample = None
 
 # Persistent monitor instance (stateful alarms)
 if "monitor" not in st.session_state:
@@ -666,7 +1390,6 @@ def compute_dynamic_flags(live_dt: datetime, row, step_seconds: int):
     if not pd.isna(hyd):
         hyd_out_of_range = int((float(hyd) < float(hyd_min)) or (float(hyd) > float(hyd_max)))
 
-    # Blood oxygen range flags based on user-selected limits
     spo2_out_of_range = 0
     if not pd.isna(spo2):
         spo2_out_of_range = int((float(spo2) < float(spo2_min)) or (float(spo2) > float(spo2_max)))
@@ -747,6 +1470,112 @@ def log_flag_transitions(live_dt: datetime, flags: dict):
     if len(st.session_state.event_log) > 400:
         st.session_state.event_log = st.session_state.event_log[-400:]
 
+# ============================================================
+# Encryption Helper Functions
+# ============================================================
+
+def save_encrypted_session_data():
+    """Save current session data with encryption"""
+    if not st.session_state.encryption_enabled:
+        st.warning("Encryption is not enabled")
+        return None
+    
+    # Prepare data to save
+    session_data = {
+        'flag_log': st.session_state.flag_log[-1000:],  # Last 1000 entries
+        'event_log': st.session_state.event_log[-500:],  # Last 500 entries
+        'timestamp': datetime.now().isoformat(),
+        'stream_position': st.session_state.i,
+        'user_profile': {
+            'age': age,
+            'weight': weight,
+            'height': height,
+            'gender': gender
+        },
+        'thresholds': {
+            'hr_min': hr_min,
+            'hr_max': hr_max,
+            'hyd_min': hyd_min,
+            'hyd_max': hyd_max,
+            'spo2_min': spo2_min,
+            'spo2_max': spo2_max
+        }
+    }
+    
+    try:
+        # Use appropriate encryptor
+        if 'user_encryptor' in st.session_state:
+            encrypted = st.session_state.user_encryptor.encrypt_user_data(session_data)
+        elif 'encryptor' in st.session_state:
+            encrypted = st.session_state.encryptor.encrypt_data(session_data)
+        else:
+            st.error("No encryptor initialized")
+            return None
+        
+        # Save to file
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        save_path = BASE_DIR / f"session_backup_{timestamp}.enc"
+        
+        with open(save_path, 'wb') as f:
+            f.write(encrypted)
+        
+        st.success(f"✅ Session saved encrypted to `{save_path.name}`")
+        return save_path
+    
+    except Exception as e:
+        st.error(f"Failed to save encrypted data: {e}")
+        return None
+
+def load_encrypted_session_data(file_path):
+    """Load and decrypt session data"""
+    try:
+        with open(file_path, 'rb') as f:
+            encrypted = f.read()
+        
+        # Try file-based decryptor first
+        if 'encryptor' in st.session_state:
+            decrypted = st.session_state.encryptor.decrypt_data(encrypted)
+            if decrypted:
+                return json.loads(decrypted)
+        
+        # Try password-based decryptor
+        if 'user_encryptor' in st.session_state:
+            decrypted = st.session_state.user_encryptor.decrypt_user_data(encrypted)
+            if decrypted:
+                return decrypted
+        
+        st.error("Could not decrypt with available encryptors")
+        return None
+    
+    except Exception as e:
+        st.error(f"Failed to load encrypted data: {e}")
+        return None
+
+def create_secure_download_link(data, filename="secure_data.enc"):
+    """Create a secure download link for encrypted data"""
+    if not st.session_state.encryption_enabled:
+        return None
+    
+    try:
+        # Prepare data packet with metadata
+        packet = {
+            'data': data,
+            'timestamp': datetime.now().isoformat(),
+            'version': '1.0'
+        }
+        
+        # Encrypt with transmitter if available
+        if 'transmitter' in st.session_state:
+            secure_packet = st.session_state.transmitter.prepare_for_transmission(
+                packet, include_metadata=True
+            )
+            return json.dumps(secure_packet)
+        
+        return None
+    
+    except Exception as e:
+        st.error(f"Failed to create secure download: {e}")
+        return None
 
 # ============================================================
 # Header (title + running badge)
@@ -756,7 +1585,7 @@ title_col, badge_col = st.columns([3, 1])
 
 with title_col:
     # Main page title
-    st.markdown("## ❤️💧Capstone Heart Rate, Hydration & Blood Oxygen Monitor")
+    st.markdown("## ❤️💧 Capstone Heart Rate, Hydration & Blood Oxygen Monitor")
 
 with badge_col:
     # Small status pill at top right
@@ -771,17 +1600,17 @@ with badge_col:
 c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
 
 with c1:
-    if st.button("▶ Start", use_container_width=True):
+    if st.button("▶ Start", use_container_width=True, key="start_button"):
         # Re-anchor timestamps so the current sample aligns with "now"
         st.session_state.stream_start_dt = datetime.now().replace(microsecond=0) - timedelta(seconds=int(st.session_state.i))
         st.session_state.running = True
 
 with c2:
-    if st.button("⏸ Stop", use_container_width=True):
+    if st.button("⏸ Stop", use_container_width=True, key="stop_button"):
         st.session_state.running = False
 
 with c3:
-    if st.button("↩ Reset", use_container_width=True):
+    if st.button("↩ Reset", use_container_width=True, key="reset_button"):
         # Reset stream index and stop playback
         st.session_state.i = 0
         st.session_state.running = False
@@ -793,7 +1622,6 @@ with c3:
         st.session_state.flag_log = []
         st.session_state.event_log = []
         st.session_state.last_flags = None
-        st.session_state.last_logged_sample = None
 
         # Clear artifact detection history
         st.session_state.prev_hr_for_flags = None
@@ -809,9 +1637,16 @@ with c3:
             spo2_threshold_high=spo2_max,
         )
 
+        # Reset encryption state (optional - comment out if you want to keep encryption settings)
+        if 'encryptor' in st.session_state:
+            del st.session_state.encryptor
+        if 'user_encryptor' in st.session_state:
+            del st.session_state.user_encryptor
+        if 'transmitter' in st.session_state:
+            del st.session_state.transmitter
+
         # Rerun so UI updates instantly
         st.rerun()
-
 with c4:
     # Progress bar through the dataset
     prog = (st.session_state.i + 1) / max(len(df), 1)
@@ -854,11 +1689,9 @@ live_dt = st.session_state.stream_start_dt + timedelta(seconds=i)
 # Compute dynamic flags (these are the saved flags the user wanted)
 dyn_flags = compute_dynamic_flags(live_dt, row, step_seconds=step)
 
-# Append logs only once per sample to avoid duplicate rows on reruns
-if st.session_state.last_logged_sample != i:
-    append_flag_log(live_dt, i, row, dyn_flags)
-    log_flag_transitions(live_dt, dyn_flags)
-    st.session_state.last_logged_sample = i
+# Append logs (per-sample log + transitions)
+append_flag_log(live_dt, i, row, dyn_flags)
+log_flag_transitions(live_dt, dyn_flags)
 
 # Feed persistent monitor using live timestamps
 st.session_state.monitor.process_hr(live_dt, row["hr_bpm_raw"])
@@ -875,33 +1708,69 @@ monitor_status = st.session_state.monitor.get_status()
 # ============================================================
 
 with tab1:
-    # First row: HR, Hydration, Blood Oxygen
+    # Top row: HR, Hydration, Blood Oxygen
     k1, k2, k3 = st.columns(3)
 
     with k1:
-        st.metric("HR (bpm)", "—" if pd.isna(hr_used) else f"{float(hr_used):.1f}")
-        st.caption("Alerts use raw sensor data. Displayed HR may be auto-cleaned.")
+        # Use BLE data if available, otherwise use simulated data
+        if ble_state["connected"] and ble_state["heart_rate"] is not None:
+            hr_display = f"{ble_state['heart_rate']:.1f}"
+            hr_metric = st.metric("HR (bpm)", hr_display)
+            st.caption("📡 Live BLE Data")
+        else:
+            hr_used = choose_hr(row)
+            hr_display = "—" if pd.isna(hr_used) else f"{float(hr_used):.1f}"
+            hr_metric = st.metric("HR (bpm)", hr_display)
+            st.caption("💾 Simulated Data")
 
     with k2:
-        st.metric("Hydration (0–1)", "—" if pd.isna(hyd_used) else f"{float(hyd_used):.3f}")
+        if ble_state["connected"] and ble_state["hydration"] is not None:
+            hyd_display = f"{ble_state['hydration']:.1f}%"
+            st.metric("Hydration", hyd_display)
+            st.caption("📡 Live BLE Data")
+        else:
+            hyd_used = row["hydration_ui_0to1"]
+            hyd_display = "—" if pd.isna(hyd_used) else f"{float(hyd_used):.3f}"
+            st.metric("Hydration (0–1)", hyd_display)
+            st.caption("💾 Simulated Data")
 
     with k3:
-        st.metric("Blood Oxygen (%)", "—" if pd.isna(spo2_used) else f"{float(spo2_used):.1f}%")
+        if ble_state["connected"] and ble_state["spo2"] is not None:
+            spo2_display = f"{ble_state['spo2']:.1f}%"
+            st.metric("Blood Oxygen (%)", spo2_display)
+            st.caption("📡 Live BLE Data")
+        else:
+            spo2_used = row["spo2_percent"]
+            spo2_display = "—" if pd.isna(spo2_used) else f"{float(spo2_used):.1f}%"
+            st.metric("Blood Oxygen (%)", spo2_display)
+            st.caption("💾 Simulated Data")
 
     # Second row: Timestamp and Battery
     k4, k5 = st.columns(2)
 
     with k4:
-        st.metric("Live Timestamp", live_dt.strftime("%Y-%m-%d %H:%M:%S"))
-
-    battery_pct = get_battery_percent_placeholder()
+        if ble_state["connected"] and ble_state["uptime"]:
+            st.metric("Device Uptime", ble_state["uptime"])
+            st.caption("📡 From ESP32")
+        else:
+            st.metric("Live Timestamp", live_dt.strftime("%Y-%m-%d %H:%M:%S"))
+            st.caption("💾 Simulated Time")
 
     with k5:
-        st.metric(
-            "Battery (%)",
-            "—" if battery_pct is None else f"{int(battery_pct)}%"
-        )
+        if ble_state["connected"] and ble_state["battery"] is not None:
+            st.metric("Battery", f"{ble_state['battery']}%")
+            st.caption("📡 Live BLE Data")
+        else:
+            battery_pct = get_battery_percent_placeholder()
+            st.metric("Battery (%)", "—" if battery_pct is None else f"{int(battery_pct)}%")
+            st.caption("💾 Simulated Data")
+
     st.markdown("<hr/>", unsafe_allow_html=True)
+
+    if ble_state["connected"]:
+        st.info("🟢 **Live BLE Connection Active** - Displaying real sensor data from ESP32 Health Patch")
+    else:
+        st.warning("🔴 **Simulation Mode** - Displaying pre-recorded dataset. Click 'Connect BLE' to receive live data.")
 
     # LEFT: alarms + alarm history (more important)
     # RIGHT: flags + flag event log + quick checks
@@ -912,7 +1781,7 @@ with tab1:
         if warnings:
             st.warning("### ⏳ Persistent Alerts \n" + "\n".join([f"- {w}" for w in warnings]))
         else:
-            st.success("### ✅ No Persistent Alarms\nNo conditions have persisted long enough to trigger an alarm.")
+            st.success("### ✅ No persistent alarms\nNo conditions have persisted long enough to trigger an alarm.")
 
         # Alarm history is shown directly (not hidden)
         st.markdown("### 📋 Alarm History ")
@@ -922,6 +1791,7 @@ with tab1:
         else:
             st.caption("No alarms have been triggered yet.")
 
+        # new change ~879
         st.markdown("### 💡 Personalized Health Tips")
         # Generate tips based on current readings and profile
         tips = []
@@ -933,20 +1803,13 @@ with tab1:
                 tips.append("• Your heart rate is approaching your max. Consider resting.")
             elif hr_current < personalized['resting_hr'] * 0.9 and hr_current > 40:
                 tips.append("• Your heart rate is lower than usual for your profile. This could indicate good fitness or need for check.")
-
         # Hydration tips based on gender and weight
         if not pd.isna(hyd_used):
             hyd_current = float(hyd_used)
             daily_water_needs = weight * 0.033  # 33ml per kg
             if hyd_current < personalized['dehydration_threshold'] * 1.1:
                 tips.append(f"• You may need hydration. Based on your weight ({weight}kg), aim for {daily_water_needs:.1f}L daily.")
-
-        # Blood oxygen tip if below the chosen safe range
-        if not pd.isna(spo2_used):
-            spo2_current = float(spo2_used)
-            if spo2_current < float(spo2_min):
-                tips.append("• Blood oxygen is below your selected threshold. Pause and check the sensor fit or the user condition.")
-
+        
         if tips:
             for tip in tips:
                 st.info(tip)
@@ -991,17 +1854,52 @@ with tab1:
         motor_state = "⚡ ON" if monitor_status["motor_on"] else "⏹️ OFF"
         st.write(f"- Motor state: **{motor_state}**")
 
+        # Add encryption status
+        if st.session_state.encryption_enabled:
+            st.write(f"- Encryption: **🔒 Enabled**")
+            if 'user_encryptor' in st.session_state:
+                st.write(f"- Method: **Password-based**")
+            elif 'encryptor' in st.session_state:
+                st.write(f"- Method: **File-based key**")
+        else:
+            st.write(f"- Encryption: **🔓 Disabled**")
+
+        # Add secure save button
+        if st.session_state.encryption_enabled:
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                if st.button("💾 Save Encrypted Session", use_container_width=True, key="save_encrypted_button"):
+                    save_encrypted_session_data()
+            
+            with col_s2:
+                # File uploader for loading
+                uploaded_file = st.file_uploader(
+                    "Load Encrypted", 
+                    type=['enc'],
+                    key="enc_uploader",
+                    label_visibility="collapsed"
+                )
+                if uploaded_file is not None:
+                    temp_path = BASE_DIR / "temp_upload.enc"
+                    with open(temp_path, 'wb') as f:
+                        f.write(uploaded_file.getbuffer())
+                    
+                    loaded_data = load_encrypted_session_data(temp_path)
+                    if loaded_data:
+                        st.success("✅ Data loaded successfully!")
+                        # You could restore session state here if needed
+                    
+                    # Clean up
+                    temp_path.unlink()
+
         # Flag event log moved here (less important than alarms)
         st.markdown("### 🧾 Flag Event Log ")
         log_df = pd.DataFrame(st.session_state.flag_log)
         flag_cols = ["hr_out_of_range", "hyd_out_of_range", "spo2_out_of_range", "hr_artifact", "hr_missing", "hyd_missing", "spo2_missing"]
 
-        if len(log_df) > 0:
-            events_df = log_df[log_df[flag_cols].any(axis=1)].copy()
-            events_df = events_df.iloc[::-1]  # newest first
-            st.dataframe(events_df.head(25), use_container_width=True, hide_index=True)
-        else:
-            st.caption("No flag events yet.")
+        events_df = log_df[log_df[flag_cols].any(axis=1)].copy()
+        events_df = events_df.iloc[::-1]  # newest first
+        st.dataframe(events_df.head(25), use_container_width=True, hide_index=True)
 
         # Keep transitions in an expander (optional)
         with st.expander("🔁 Flag transitions (Last 12)"):
@@ -1011,7 +1909,7 @@ with tab1:
             else:
                 st.caption("No transitions yet.")
 
-    # Profile summary expander
+    # Profile summary expander (new change ~918)
     with st.expander("👤 Your Profile Summary", expanded=False):
         prof_col1, prof_col2, prof_col3 = st.columns(3)
         with prof_col1:
@@ -1045,12 +1943,10 @@ with tab2:
     # Build HR signals for plotting
     df_window["hr_used"] = df_window["hr_bpm_clean"] if auto_clean else df_window["hr_bpm_raw"]
     df_window["hr_used_sm"] = apply_smoothing(df_window["hr_used"])
+    df_window["hr_raw_sm"] = apply_smoothing(df_window["hr_bpm_raw"])
 
-    # Build hydration smoothed column for plotting
+    # Build hydration smoothed column for plotting (avoids px.line label weirdness)
     df_window["hyd_sm"] = apply_smoothing(df_window["hydration_ui_0to1"])
-
-    # Build blood oxygen smoothed column for plotting
-    df_window["spo2_sm"] = apply_smoothing(df_window["spo2_percent"])
 
     # Pull matching saved flags for markers (so chart markers match what’s logged)
     log_df = pd.DataFrame(st.session_state.flag_log)
@@ -1060,90 +1956,93 @@ with tab2:
     if len(log_window) > 0:
         log_window["timestamp_live"] = pd.to_datetime(log_window["timestamp_live"])
 
-    # Heart rate chart
-    st.markdown("### Heart Rate Trend")
-    hr_fig = px.line(
-        df_window,
-        x="timestamp_live",
-        y="hr_used_sm",
-        title="Heart Rate (recent)",
-        labels={"hr_used_sm": "HR (bpm)", "timestamp_live": "Time"},
-    )
+    left, middle, right = st.columns(3)
 
-    # Marker points from saved flag log (not baseline flags)
-    if show_flag_markers and len(log_window) > 0:
-        pts = log_window[
-            (log_window["hr_out_of_range"] == 1)
-            | (log_window["hr_artifact"] == 1)
-            | (log_window["hr_missing"] == 1)
-        ].copy()
+    with left:
+        # HR chart (smoothed)
+        # Single-line HR plot only (no overlay)
+        hr_fig = px.line(
+            df_window,
+            x="timestamp_live",
+            y="hr_used_sm",
+            title="Heart Rate (recent)",
+            labels={"hr_used_sm": "HR (bpm)", "timestamp_live": "Time"},
+        )
 
-        if len(pts) > 0:
-            s = px.scatter(
-                pts,
-                x="timestamp_live",
-                y="hr_bpm_raw",
-                hover_data=["hr_out_of_range", "hr_artifact", "hr_missing"],
-            ).data[0]
-            s.name = "Flagged HR points (saved)"
-            hr_fig.add_trace(s)
+        # Marker points from saved flag log (not baseline flags)
+        if show_flag_markers and len(log_window) > 0:
+            pts = log_window[
+                (log_window["hr_out_of_range"] == 1)
+                | (log_window["hr_artifact"] == 1)
+                | (log_window["hr_missing"] == 1)
+            ].copy()
 
-    hr_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), height=320)
-    st.plotly_chart(hr_fig, use_container_width=True)
+            if len(pts) > 0:
+                s = px.scatter(
+                    pts,
+                    x="timestamp_live",
+                    y="hr_bpm_raw",
+                    hover_data=["hr_out_of_range", "hr_artifact", "hr_missing"],
+                ).data[0]
+                s.name = "Flagged HR points (saved)"
+                hr_fig.add_trace(s)
 
-    # Hydration chart
-    st.markdown("### Hydration Trend")
-    hy_fig = px.line(
-        df_window,
-        x="timestamp_live",
-        y="hyd_sm",
-        title="Hydration (recent)",
-        labels={"timestamp_live": "Time", "hyd_sm": "Hydration (0–1)"},
-    )
+        hr_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(hr_fig, use_container_width=True)
 
-    # Hydration markers from saved log
-    if show_flag_markers and len(log_window) > 0:
-        pts2 = log_window[(log_window["hyd_out_of_range"] == 1) | (log_window["hyd_missing"] == 1)].copy()
+    with middle:
+        # Hydration chart (smoothed)
+        hy_fig = px.line(
+            df_window,
+            x="timestamp_live",
+            y="hyd_sm",
+            title="Hydration (recent)",
+            labels={"timestamp_live": "Time", "hyd_sm": "Hydration (0–1)"},
+        )
 
-        if len(pts2) > 0:
-            s2 = px.scatter(
-                pts2,
-                x="timestamp_live",
-                y="hydration_0to1",
-                hover_data=["hyd_out_of_range", "hyd_missing"],
-            ).data[0]
-            s2.name = "Flagged hydration points (saved)"
-            hy_fig.add_trace(s2)
+        # Hydration markers from saved log
+        if show_flag_markers and len(log_window) > 0:
+            pts2 = log_window[(log_window["hyd_out_of_range"] == 1) | (log_window["hyd_missing"] == 1)].copy()
 
-    hy_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), height=320)
-    st.plotly_chart(hy_fig, use_container_width=True)
+            if len(pts2) > 0:
+                s2 = px.scatter(
+                    pts2,
+                    x="timestamp_live",
+                    y="hydration_0to1",
+                    hover_data=["hyd_out_of_range", "hyd_missing"],
+                ).data[0]
+                s2.name = "Flagged hydration points (saved)"
+                hy_fig.add_trace(s2)
 
-    # Blood oxygen chart
-    st.markdown("### Blood Oxygen Trend")
-    spo2_fig = px.line(
-        df_window,
-        x="timestamp_live",
-        y="spo2_sm",
-        title="Blood Oxygen (recent)",
-        labels={"timestamp_live": "Time", "spo2_sm": "SpO₂ (%)"},
-    )
+        hy_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(hy_fig, use_container_width=True)
 
-    # Blood oxygen markers from saved log
-    if show_flag_markers and len(log_window) > 0:
-        pts3 = log_window[(log_window["spo2_out_of_range"] == 1) | (log_window["spo2_missing"] == 1)].copy()
+    with right:
+        # Blood oxygen chart (smoothed)
+        df_window["spo2_sm"] = apply_smoothing(df_window["spo2_percent"])
+        spo2_fig = px.line(
+            df_window,
+            x="timestamp_live",
+            y="spo2_sm",
+            title="Blood Oxygen (recent)",
+            labels={"timestamp_live": "Time", "spo2_sm": "Blood Oxygen (%)"},
+        )
 
-        if len(pts3) > 0:
-            s3 = px.scatter(
-                pts3,
-                x="timestamp_live",
-                y="spo2_percent",
-                hover_data=["spo2_out_of_range", "spo2_missing"],
-            ).data[0]
-            s3.name = "Flagged SpO₂ points (saved)"
-            spo2_fig.add_trace(s3)
+        if show_flag_markers and len(log_window) > 0:
+            pts3 = log_window[(log_window["spo2_out_of_range"] == 1) | (log_window["spo2_missing"] == 1)].copy()
 
-    spo2_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10), height=320)
-    st.plotly_chart(spo2_fig, use_container_width=True)
+            if len(pts3) > 0:
+                s3 = px.scatter(
+                    pts3,
+                    x="timestamp_live",
+                    y="spo2_percent",
+                    hover_data=["spo2_out_of_range", "spo2_missing"],
+                ).data[0]
+                s3.name = "Flagged blood oxygen points (saved)"
+                spo2_fig.add_trace(s3)
+
+        spo2_fig.update_layout(legend_title_text="", margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(spo2_fig, use_container_width=True)
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.caption("Markers come from your saved flag log, so the chart matches what is being recorded.")
@@ -1160,16 +2059,47 @@ with tab3:
 
     st.markdown("<hr/>", unsafe_allow_html=True)
 
+    # Add secure download section if encryption is enabled
+    if st.session_state.encryption_enabled:
+        st.subheader("🔒 Secure Export")
+        
+        # Prepare data for secure export
+        export_data = {
+            'current_readings': {
+                'heart_rate': float(hr_used) if not pd.isna(hr_used) else None,
+                'hydration': float(hyd_used) if not pd.isna(hyd_used) else None,
+                'blood_oxygen': float(spo2_used) if not pd.isna(spo2_used) else None,
+                'timestamp': live_dt.isoformat()
+            },
+            'recent_flags': st.session_state.flag_log[-50:],
+            'alarm_history': st.session_state.monitor.alarm_history[-20:],
+            'user_profile': {
+                'age': age,
+                'weight': weight,
+                'height': height,
+                'gender': gender
+            }
+        }
+        
+        secure_packet = create_secure_download_link(export_data)
+        if secure_packet:
+            st.download_button(
+                "🔐 Download Encrypted Snapshot",
+                data=secure_packet.encode('utf-8'),
+                file_name=f"health_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json.enc",
+                mime="application/json",
+                use_container_width=True
+            )
+        
+        st.markdown("<hr/>", unsafe_allow_html=True)
+
     # Show session logs (saved during this run)
     st.subheader("Saved logs (session)")
     log_df = pd.DataFrame(st.session_state.flag_log)
     ev_df = pd.DataFrame(st.session_state.event_log)
 
     st.markdown("**Per-sample flag log (latest 50):**")
-    if len(log_df) > 0:
-        st.dataframe(log_df.iloc[::-1].head(50), use_container_width=True, hide_index=True)
-    else:
-        st.caption("No samples logged yet.")
+    st.dataframe(log_df.iloc[::-1].head(50), use_container_width=True, hide_index=True)
 
     st.markdown("**Flag transition log (latest 50):**")
     if len(ev_df) > 0:
@@ -1184,26 +2114,39 @@ with tab3:
 
     with cdl1:
         # Download just the current window of the log (matches the chart window concept)
-        window_log = log_df[(log_df["sample"] >= max(0, i - int(window_s))) & (log_df["sample"] <= i)].copy() if len(log_df) > 0 else pd.DataFrame()
-
-        st.download_button(
-            "⬇️ Download current window flag log (CSV)",
-            data=window_log.to_csv(index=False).encode("utf-8"),
-            file_name="capstone_window_flag_log.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        try:
+            window_log = log_df[(log_df["sample"] >= max(0, i - int(window_s))) & (log_df["sample"] <= i)].copy()
+            
+            if not window_log.empty:
+                st.download_button(
+                    "⬇️ Download current window flag log (CSV)",
+                    data=window_log.to_csv(index=False).encode("utf-8"),
+                    file_name=f"capstone_window_flag_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_window_log_button"
+                )
+            else:
+                st.info("No data available in current window for download")
+        except Exception as e:
+            st.error(f"Error preparing window log: {e}")
 
     with cdl2:
         # Download entire session log
-        st.download_button(
-            "⬇️ Download full flag log (CSV)",
-            data=log_df.to_csv(index=False).encode("utf-8"),
-            file_name="capstone_full_flag_log.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
+        try:
+            if not log_df.empty:
+                st.download_button(
+                    "⬇️ Download full flag log (CSV)",
+                    data=log_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"capstone_full_flag_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_full_log_button"
+                )
+            else:
+                st.info("No log data available for download")
+        except Exception as e:
+            st.error(f"Error preparing full log: {e}")
 
 # ============================================================
 # Stream loop (advance by 1/2/5 seconds per tick)
