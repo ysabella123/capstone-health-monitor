@@ -918,7 +918,7 @@ def load_data():
     # Standardize into the names used by the dashboard
     df = pd.DataFrame()
     df["hr_bpm_raw"] = pd.to_numeric(raw["heart_rate_bpm"], errors="coerce")
-    df["hydration_percent"] = pd.to_numeric(raw["hydration_0to1"], errors="coerce") * 100.0
+    df["hydration_percent"] = pd.to_numeric(raw["hydration_0to1"], errors="coerce")
 
     # Blood oxygen column support
     # This accepts a few possible Excel column names and standardizes them to spo2_percent
