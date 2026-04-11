@@ -1777,9 +1777,7 @@ with tab1:
 
     if ble_state["connected"]:
         st.info("🟢 **Live BLE Connection Active** - Displaying real sensor data from ESP32 Health Patch")
-    else:
-        st.warning("🔴 **Simulation Mode** - Displaying pre-recorded dataset. Click 'Connect BLE' to receive live data.")
-
+    
     # LEFT: alarms + alarm history (more important)
     # RIGHT: flags + flag event log + quick checks
     left_col, right_col = st.columns([2, 1])
