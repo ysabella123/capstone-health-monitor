@@ -93,8 +93,8 @@ class ContinuousHealthMonitor:
         self,
         hr_threshold_low=30,                 # user min HR
         hr_threshold_high=220,               # user max HR
-        hydration_threshold_low=0.30,        # user min hydration (0–1)
-        hydration_threshold_high=1,          # user max hydration (0–1)
+        hydration_threshold_low=-5.0,        # user min hydration change (%)
+        hydration_threshold_high=5.0,         # user max hydration change (%)
         spo2_threshold_low=95.0,             # user min blood oxygen (%)
         spo2_threshold_high=100.0,           # user max blood oxygen (%)
         hr_hold_ticks=5,                     # how many ticks HR must persist abnormal 5s
@@ -167,7 +167,7 @@ class ContinuousHealthMonitor:
         return (hr_value < self.hr_threshold_low) or (hr_value > self.hr_threshold_high)
     
     def is_hydration_abnormal(self, hydration_value):
-        # Hydration abnormal means outside user min/max (0–1 scale)
+        # Hydration abnormal means outside user min/max (% change scale)
         if hydration_value is None or pd.isna(hydration_value):
             return False
         hydration_value = float(hydration_value)
@@ -225,7 +225,7 @@ class ContinuousHealthMonitor:
         self.update_motor_state(live_dt)
 
     def process_hydration(self, live_dt: datetime, hydration_value):
-        # Run on every UI tick with current hydration value (0–1)
+        # Run on every UI tick with current hydration value (% change)
         # Same persistence logic concept as HR.
 
         if hydration_value is None or pd.isna(hydration_value):
@@ -254,7 +254,7 @@ class ContinuousHealthMonitor:
                 self._log_alarm(
                     live_dt,
                     "Hydration Abnormal",
-                    f"{float(hydration_value):.3f} for {self.abnormal_hydration_count} ticks",
+                    f"{float(hydration_value):.1f}% for {self.abnormal_hydration_count} ticks",
                 )
         else:
             if self.hydration_abnormal_warning:
@@ -777,7 +777,7 @@ def process_ble_data():
                 # Update monitor with real hydration data
                 current_time = datetime.now()
                 # Convert percentage to 0-1 scale if needed
-                hydration_value = data["value"] / 100.0 if data["value"] > 1 else data["value"]
+                hydration_value = data["value"]
                 if "monitor" in st.session_state:
                     st.session_state.monitor.process_hydration(current_time, hydration_value)
                 
@@ -918,7 +918,7 @@ def load_data():
     # Standardize into the names used by the dashboard
     df = pd.DataFrame()
     df["hr_bpm_raw"] = pd.to_numeric(raw["heart_rate_bpm"], errors="coerce")
-    df["hydration_ui_0to1"] = pd.to_numeric(raw["hydration_0to1"], errors="coerce")
+    df["hydration_percent"] = pd.to_numeric(raw["hydration_0to1"], errors="coerce") * 100.0
 
     # Blood oxygen column support
     # This accepts a few possible Excel column names and standardizes them to spo2_percent
@@ -1014,17 +1014,17 @@ def calculate_personalized_thresholds(age, weight, height, gender):
     total_body_water_liters = weight * tbw_percent
     
     # Dehydration threshold: loss of 2% of body weight from water
-    dehydration_threshold = 1.0 - (0.02 * weight / total_body_water_liters)
+    dehydration_threshold = -5.0
     
     # Overhydration threshold (rare, but for safety)
-    overhydration_threshold = 1.05  # 5% above normal
+    overhydration_threshold = 5.0  # 5% above normal
     
     return {
         'hr_max': hr_max,
         'resting_hr': resting_hr,
         'hr_normal_min': hr_normal_min,
         'hr_normal_max': hr_normal_max,
-        'dehydration_threshold': max(0.3, dehydration_threshold),  # Don't go below 0.3
+        'dehydration_threshold': dehydration_threshold
         'overhydration_threshold': overhydration_threshold,
         'total_body_water_liters': total_body_water_liters
     }
@@ -1038,7 +1038,7 @@ with st.sidebar.expander("Your Personalized Metrics", expanded=False):
     st.write(f"**Resting HR:** {personalized['resting_hr']} bpm")
     st.write(f"**Normal HR Range:** {personalized['hr_normal_min']}-{personalized['hr_normal_max']} bpm")
     st.write(f"**Total Body Water:** {personalized['total_body_water_liters']:.1f} L")
-    st.write(f"**Dehydration threshold:** {personalized['dehydration_threshold']:.2f}")
+    st.write(f"**Hydration change range:** {personalized['dehydration_threshold']:.1f}% to {personalized['overhydration_threshold']:.1f}%")
 
 
 # # Preset modes only set default values in the sidebar
@@ -1047,19 +1047,19 @@ with st.sidebar.expander("Your Personalized Metrics", expanded=False):
 # # Preset defaults
 # if mode == "General":
 #     default_hr_min, default_hr_max, default_jump = 45, 185, 40
-#     default_hyd_min, default_hyd_max = 0.30, 1.00
+#     default_hyd_min, default_hyd_max = -5.0, 5.0
 #     auto_clean_default = True
 # if mode == "Athlete":
 #     default_hr_min, default_hr_max, default_jump = 50, 205, 50
-#     default_hyd_min, default_hyd_max = 0.20, 1.00
+#     default_hyd_min, default_hyd_max = -5.0, 5.0
 #     auto_clean_default = True
 # elif mode == "Sleep":
 #     default_hr_min, default_hr_max, default_jump = 30, 100, 30
-#     default_hyd_min, default_hyd_max = 0.30, 1.00
+#     default_hyd_min, default_hyd_max = -5.0, 5.0
 #     auto_clean_default = True
 # else:
 #     default_hr_min, default_hr_max, default_jump = 45, 220, 60
-#     default_hyd_min, default_hyd_max = 0.10, 1.00
+#     default_hyd_min, default_hyd_max = -5.0, 5.0
 #     auto_clean_default = False
 default_jump = 40
 auto_clean_default = True
@@ -1087,16 +1087,16 @@ else:
     
     if mode == "General":
         default_hr_min, default_hr_max = 45, 185
-        default_hyd_min, default_hyd_max = 0.30, 1.00
+        default_hyd_min, default_hyd_max = -5.0, 5.0
     elif mode == "Athlete":
         default_hr_min, default_hr_max = 40, 200
-        default_hyd_min, default_hyd_max = 0.20, 1.00
+        default_hyd_min, default_hyd_max = -5.0, 5.0
     elif mode == "Sleep":
         default_hr_min, default_hr_max = 40, 100
-        default_hyd_min, default_hyd_max = 0.30, 1.00
+        default_hyd_min, default_hyd_max = -5.0, 5.0
     else:  # Disorder-safe
-        default_hr_min, default_hyd_min = 30, 0.10
-        default_hr_max, default_hyd_max = 220, 1.00
+        default_hr_min, default_hyd_min = 30, -5.0
+        default_hr_max, default_hyd_max = 220, 5.0
     
     default_jump = 40  # Default jump threshold
     auto_clean_default = True
@@ -1112,16 +1112,16 @@ with st.sidebar.expander("Set Thresholds Manually", expanded=not use_personalize
                             step=1.0,
                             help="Above this triggers high HR alert")
 
-    hyd_min = st.number_input("Hydration min (0–1)", 
+    hyd_min = st.number_input("Hydration min (%)", 
                              value=float(default_hyd_min), 
-                             step=0.05, 
-                             format="%.2f",
+                             step=1.0, 
+                             format="%.1f",
                              help="Below this indicates dehydration")
     
-    hyd_max = st.number_input("Hydration max (0–1)", 
+    hyd_max = st.number_input("Hydration max (%)", 
                              value=float(default_hyd_max), 
-                             step=0.05, 
-                             format="%.2f",
+                             step=1.0, 
+                             format="%.1f",
                              help="Above this may indicate overhydration")
 
     max_delta = st.number_input("Max HR jump (bpm/s)", 
@@ -1134,8 +1134,8 @@ with st.sidebar.expander("Thresholds", expanded=True):
     hr_min = st.number_input("Heart Rate min (bpm)", value=float(default_hr_min), step=1.0)
     hr_max = st.number_input("Heart Rate max (bpm)", value=float(default_hr_max), step=1.0)
 
-    hyd_min = st.number_input("Hydration min (0–1)", value=float(default_hyd_min), step=0.05, format="%.2f")
-    hyd_max = st.number_input("Hydration max (0–1)", value=float(default_hyd_max), step=0.05, format="%.2f")
+    hyd_min = st.number_input("Hydration min (%)", value=float(default_hyd_min), step=1.0, format="%.1f")
+    hyd_max = st.number_input("Hydration max (%)", value=float(default_hyd_max), step=1.0, format="%.1f")
 
     spo2_min = st.number_input("Blood Oxygen min (%)", value=95.0, step=1.0)
     spo2_max = st.number_input("Blood Oxygen max (%)", value=100.0, step=1.0)
@@ -1172,12 +1172,6 @@ with st.sidebar.expander("Display", expanded=False):
     # Optional overlay + marker toggles
     show_flag_markers = st.checkbox("Show outlier/disconnect markers", value=True)
     
-# Sidebar dataset info
-st.sidebar.markdown("---")
-st.sidebar.caption("Data")
-st.sidebar.write("File:", f"`{EXCEL_FILE.name}`")
-st.sidebar.write("Sheet:", f"`{SHEET}`")
-st.sidebar.write("Rows:", f"`{len(df):,}`")
 
 # ============================================================
 # Encryption Settings (Add this after dataset info in sidebar)
@@ -1392,7 +1386,7 @@ def choose_hr(row):
 def compute_dynamic_flags(live_dt: datetime, row, step_seconds: int):
 
     hr_raw = row["hr_bpm_raw"]
-    hyd = row["hydration_ui_0to1"]
+    hyd = row["hydration_percent"]
     spo2 = row["spo2_percent"]
 
     # Missing flags
@@ -1452,7 +1446,7 @@ def append_flag_log(live_dt: datetime, idx: int, row, flags: dict):
             "timestamp_live": live_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "sample": int(idx),
             "hr_bpm_raw": None if pd.isna(row["hr_bpm_raw"]) else float(row["hr_bpm_raw"]),
-            "hydration_0to1": None if pd.isna(row["hydration_ui_0to1"]) else float(row["hydration_ui_0to1"]),
+            "hydration_percent": None if pd.isna(row["hydration_percent"]) else float(row["hydration_percent"]),
             "spo2_percent": None if pd.isna(row["spo2_percent"]) else float(row["spo2_percent"]),
             **flags,
         }
@@ -1697,7 +1691,7 @@ row = df.iloc[i]
 hr_used = choose_hr(row)
 
 # Hydration value (always raw)
-hyd_used = row["hydration_ui_0to1"]
+hyd_used = row["hydration_percent"]
 
 # Blood oxygen value (always raw)
 spo2_used = row["spo2_percent"]
@@ -1744,12 +1738,12 @@ with tab1:
     with k2:
         if ble_state["connected"] and ble_state["hydration"] is not None:
             hyd_display = f"{ble_state['hydration']:.1f}%"
-            st.metric("Hydration", hyd_display)
+            st.metric("Hydration (%)", hyd_display)
             st.caption("📡 Live BLE Data")
         else:
-            hyd_used = row["hydration_ui_0to1"]
-            hyd_display = "—" if pd.isna(hyd_used) else f"{float(hyd_used):.3f}"
-            st.metric("Hydration (0–1)", hyd_display)
+            hyd_used = row["hydration_percent"]
+            hyd_display = "—" if pd.isna(hyd_used) else f"{float(hyd_used):.1f}%"
+            st.metric("Hydration (%)", hyd_display)
 
     with k3:
         if ble_state["connected"] and ble_state["spo2"] is not None:
@@ -1960,7 +1954,7 @@ with tab2:
     df_window["hr_raw_sm"] = apply_smoothing(df_window["hr_bpm_raw"])
 
     # Build hydration smoothed column for plotting (avoids px.line label weirdness)
-    df_window["hyd_sm"] = apply_smoothing(df_window["hydration_ui_0to1"])
+    df_window["hyd_sm"] = apply_smoothing(df_window["hydration_percent"])
 
     # Pull matching saved flags for markers (so chart markers match what’s logged)
     log_df = pd.DataFrame(st.session_state.flag_log)
@@ -2011,7 +2005,7 @@ with tab2:
             x="timestamp_live",
             y="hyd_sm",
             title="Hydration (recent)",
-            labels={"timestamp_live": "Time", "hyd_sm": "Hydration (0–1)"},
+            labels={"timestamp_live": "Time", "hyd_sm": "Hydration (%)"},
         )
 
         # Hydration markers from saved log
