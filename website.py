@@ -1024,7 +1024,7 @@ def calculate_personalized_thresholds(age, weight, height, gender):
         'resting_hr': resting_hr,
         'hr_normal_min': hr_normal_min,
         'hr_normal_max': hr_normal_max,
-        'dehydration_threshold': dehydration_threshold
+        'dehydration_threshold': dehydration_threshold,
         'overhydration_threshold': overhydration_threshold,
         'total_body_water_liters': total_body_water_liters
     }
