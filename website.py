@@ -1740,7 +1740,6 @@ with tab1:
             hr_used = choose_hr(row)
             hr_display = "—" if pd.isna(hr_used) else f"{float(hr_used):.1f}"
             hr_metric = st.metric("HR (bpm)", hr_display)
-            st.caption("💾 Simulated Data")
 
     with k2:
         if ble_state["connected"] and ble_state["hydration"] is not None:
@@ -1751,7 +1750,6 @@ with tab1:
             hyd_used = row["hydration_ui_0to1"]
             hyd_display = "—" if pd.isna(hyd_used) else f"{float(hyd_used):.3f}"
             st.metric("Hydration (0–1)", hyd_display)
-            st.caption("💾 Simulated Data")
 
     with k3:
         if ble_state["connected"] and ble_state["spo2"] is not None:
@@ -1762,7 +1760,6 @@ with tab1:
             spo2_used = row["spo2_percent"]
             spo2_display = "—" if pd.isna(spo2_used) else f"{float(spo2_used):.1f}%"
             st.metric("Blood Oxygen (%)", spo2_display)
-            st.caption("💾 Simulated Data")
 
     # Second row: Timestamp and Battery
     k4, k5 = st.columns(2)
@@ -1773,7 +1770,6 @@ with tab1:
             st.caption("📡 From ESP32")
         else:
             st.metric("Live Timestamp", live_dt.strftime("%Y-%m-%d %H:%M:%S"))
-            st.caption("💾 Simulated Time")
 
     with k5:
         if ble_state["connected"] and ble_state["battery"] is not None:
@@ -1782,7 +1778,6 @@ with tab1:
         else:
             battery_pct = get_battery_percent_placeholder()
             st.metric("Battery (%)", "—" if battery_pct is None else f"{int(battery_pct)}%")
-            st.caption("💾 Simulated Data")
 
     st.markdown("<hr/>", unsafe_allow_html=True)
 
